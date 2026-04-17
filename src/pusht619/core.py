@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import jaxsim.api as js
 import jaxsim.mujoco
+import jaxsim.rbda.contacts as _jsc
 import matplotlib.pyplot as plt
 import mujoco as mj
 import rod
@@ -33,15 +34,41 @@ PUSHER_RADIUS = 0.01
 PUSHER_CLEARANCE = 0.005
 PUSHER_APPROACH_DISTANCE = 0.04
 DEFAULT_PUSH_DISTANCE = 0.10
-PUSHER_KP = 250.0
-PUSHER_KD = 30.0
-PUSHER_MAX_FORCE = 30.0
+PUSHER_KP = 400.0
+PUSHER_KD = 40.0
+PUSHER_MAX_FORCE = 80.0
+
+# Target speeds for the two trajectory phases of a single step().
+# The approach phase moves the pusher from `pusher_start` to `pre_contact`
+# (`PUSHER_APPROACH_DISTANCE`) at `PUSHER_APPROACH_VELOCITY`; the push phase
+# then advances `DEFAULT_PUSH_DISTANCE` at `PUSHER_PUSH_VELOCITY`.  Any leftover
+# budget of `n_sim_steps` is a "hold" phase where the pusher target stays put
+# and the T-block coasts/settles under floor friction.
+PUSHER_APPROACH_VELOCITY = 4.0  # m/s
+PUSHER_PUSH_VELOCITY = 2.0  # m/s
 
 # JaxSim only supports point-vs-terrain contacts, not body-vs-body, so we add
 # our own analytical spring-damper contact between the pusher and the T block.
 T_PUSHER_CONTACT_K = 2.0e4  # N/m  (~1 mm penetration at 20 N)
 T_PUSHER_CONTACT_D = 80.0  # N·s/m
 PUSHER_EFFECTIVE_RADIUS = PUSHER_RADIUS  # collision radius of the pusher
+
+# Explicit joint-space friction on the T<->floor interface. We disable JaxSim's
+# implicit terrain tangential friction (contact mu=0) and model the floor
+# friction here so the behaviour is fully controllable.
+# Total effective friction force on a moving T translating with velocity v is:
+#     F_fric = -(T_FLOOR_MU * T_MASS * G) * tanh(v / T_FLOOR_V_EPS) - T_FLOOR_C_LIN * v
+# and similarly for rotation, with T_FLOOR_ROT_RADIUS giving the moment arm
+# used for Coulomb rotational friction.
+T_MASS = 0.6  # kg, matches the SDF <mass> on link t_block
+_GRAVITY_MAG = 9.81
+FRICTION_SCALE = 2.0
+T_FLOOR_MU = FRICTION_SCALE*0.35  # Coulomb coefficient
+T_FLOOR_C_LIN = FRICTION_SCALE*2.0  # N·s/m  (viscous linear)
+T_FLOOR_C_ROT = FRICTION_SCALE*0.02  # N·m·s/rad  (viscous rotational)
+T_FLOOR_V_EPS = 5.0e-3  # m/s   (tanh smoothing: below this, behaves like viscous)
+T_FLOOR_W_EPS = 5.0e-2  # rad/s (tanh smoothing for rotational)
+T_FLOOR_ROT_RADIUS = FRICTION_SCALE*0.086  # m, ≈ sqrt(izz/m) from the SDF (4.469e-3 / 0.6)
 
 # T body-frame 2D geometry (xy only; z is ignored because everything lives on the floor).
 # Matches the two collision boxes defined in assets/scene.sdf for link "t_block".
@@ -143,6 +170,26 @@ def _pusher_t_contact_force_single(
 _pusher_t_contact_force_batched = jax.jit(
     jax.vmap(_pusher_t_contact_force_single, in_axes=(0, 0, 0, 0, 0, 0))
 )
+
+
+def _t_floor_friction_single(
+    t_vel_xy: jnp.ndarray,
+    t_omega: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Coulomb + viscous friction between the T-block and the floor.
+
+    Returns (F_fric_world (2,), tau_fric). Forces act on the T-block's
+    `t_block_joint_x/y/theta` joints (which are world-axis aligned).
+    """
+    coulomb_lin = T_FLOOR_MU * T_MASS * _GRAVITY_MAG
+    coulomb_rot = T_FLOOR_MU * T_MASS * _GRAVITY_MAG * T_FLOOR_ROT_RADIUS
+
+    F_fric = -coulomb_lin * jnp.tanh(t_vel_xy / T_FLOOR_V_EPS) - T_FLOOR_C_LIN * t_vel_xy
+    tau_fric = -coulomb_rot * jnp.tanh(t_omega / T_FLOOR_W_EPS) - T_FLOOR_C_ROT * t_omega
+    return F_fric, tau_fric
+
+
+_t_floor_friction_batched = jax.jit(jax.vmap(_t_floor_friction_single, in_axes=(0, 0)))
 
 
 # ── Action dataclass ──────────────────────────────────────────────────────────
@@ -290,6 +337,7 @@ class PushTEnv:
         self._model = js.model.JaxSimModel.build_from_model_description(
             model_description=model_sdf_string,
             time_step=0.001,
+            contact_params=_jsc.SoftContactsParams.build(mu=0.0),
         )
 
         joint_names = self._model.joint_names()
@@ -519,11 +567,34 @@ class PushTEnv:
             base_angular_velocity=jnp.zeros_like(self._data._base_angular_velocity),
             joint_velocities=jnp.zeros_like(self._data.joint_velocities),
         )
+        # Cache the pinned base state so every sim step can re-clamp it.
+        # `env_center` is structurally a floating base in the SDF, so any joint
+        # force applied on descendant joints (pusher, T) creates a reaction that
+        # drifts env_center. We pin it every sim step to behave as a fixed base.
+        self._pinned_base_position = self._data.base_position
+        self._pinned_base_quaternion = self._data.base_quaternion
+        self._pinned_base_linear_velocity = jnp.zeros_like(self._data._base_linear_velocity)
+        self._pinned_base_angular_velocity = jnp.zeros_like(self._data._base_angular_velocity)
         zero_forces = jnp.zeros((self._nenvs, self._model.dofs()))
         self._data = step_parallel(self._model, self._data, zero_forces)
+        self._data = self._pin_base(self._data)
         self._poses = self._current_t_poses()
         self._sync_visualizer()
         return self._poses.copy()
+
+    def _pin_base(self, data: js.data.JaxSimModelData) -> js.data.JaxSimModelData:
+        """Force env_center back to its fixed world pose with zero velocity.
+
+        This prevents the floating base from drifting due to reaction forces
+        from joint torques applied to the pusher/T-block.
+        """
+        return data.replace(
+            model=self._model,
+            base_position=self._pinned_base_position,
+            base_quaternion=self._pinned_base_quaternion,
+            base_linear_velocity=self._pinned_base_linear_velocity,
+            base_angular_velocity=self._pinned_base_angular_velocity,
+        )
 
     def step(self, action: Action, n_sim_steps: int = 10) -> ActionResult:
         """
@@ -547,8 +618,15 @@ class PushTEnv:
             model=self._model, joint_positions=joint_positions, joint_velocities=joint_velocities
         )
 
-        approach_steps = max(1, n_sim_steps // 4)
-        push_steps = max(1, n_sim_steps - approach_steps)
+        dt = self._model.time_step
+        # Fixed target velocities -> step counts independent of n_sim_steps.
+        approach_steps_full = max(1, int(round(PUSHER_APPROACH_DISTANCE / (PUSHER_APPROACH_VELOCITY * dt))))
+        push_steps_full = max(1, int(round(DEFAULT_PUSH_DISTANCE / (PUSHER_PUSH_VELOCITY * dt))))
+        # Clip so approach + push fits within n_sim_steps; any remainder is "hold".
+        approach_steps = min(approach_steps_full, n_sim_steps)
+        push_steps = min(push_steps_full, n_sim_steps - approach_steps)
+        hold_steps = n_sim_steps - approach_steps - push_steps
+
         approach_scales = np.linspace(0.0, 1.0, num=approach_steps, endpoint=True, dtype=np.float64)
         push_scales = np.linspace(
             0.0,
@@ -562,6 +640,10 @@ class PushTEnv:
         )
         push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
         pusher_targets = np.concatenate([approach_targets, push_targets], axis=1)
+        if hold_steps > 0:
+            final_target = pusher_targets[:, -1:, :]
+            hold_targets = np.broadcast_to(final_target, (self._nenvs, hold_steps, 2)).copy()
+            pusher_targets = np.concatenate([pusher_targets, hold_targets], axis=1)
         pusher_targets = pusher_targets[:, :n_sim_steps, :]
         workspace_margin = PUSHER_RADIUS
         pusher_targets = np.clip(
@@ -569,7 +651,6 @@ class PushTEnv:
             workspace_margin,
             np.array([WORKSPACE_WIDTH, WORKSPACE_HEIGHT]) - workspace_margin,
         )
-        dt = self._model.time_step
         pusher_target_velocities = np.zeros_like(pusher_targets)
         pusher_target_velocities[:, 1:, :] = (pusher_targets[:, 1:, :] - pusher_targets[:, :-1, :]) / dt
 
@@ -620,13 +701,17 @@ class PushTEnv:
                 current_xy, current_velocity_xy, t_xy, t_vel_xy, t_theta, t_omega
             )
 
+            # Floor friction on the T-block (Coulomb + viscous).
+            F_fric_world, tau_fric = _t_floor_friction_batched(t_vel_xy, t_omega)
+
             joint_forces = jnp.zeros((self._nenvs, self._model.dofs()))
             joint_forces = joint_forces.at[:, self._pusher_x_idx].set(pusher_forces[:, 0] + F_pusher_world[:, 0])
             joint_forces = joint_forces.at[:, self._pusher_y_idx].set(pusher_forces[:, 1] + F_pusher_world[:, 1])
-            joint_forces = joint_forces.at[:, self._T_x_idx].set(F_t_world[:, 0])
-            joint_forces = joint_forces.at[:, self._T_y_idx].set(F_t_world[:, 1])
-            joint_forces = joint_forces.at[:, self._T_theta_idx].set(tau_t)
+            joint_forces = joint_forces.at[:, self._T_x_idx].set(F_t_world[:, 0] + F_fric_world[:, 0])
+            joint_forces = joint_forces.at[:, self._T_y_idx].set(F_t_world[:, 1] + F_fric_world[:, 1])
+            joint_forces = joint_forces.at[:, self._T_theta_idx].set(tau_t + tau_fric)
             self._data = step_parallel(self._model, self._data, joint_forces)
+            self._data = self._pin_base(self._data)
 
             x = self._data.joint_positions[:, self._T_x_idx]
             y = self._data.joint_positions[:, self._T_y_idx]
