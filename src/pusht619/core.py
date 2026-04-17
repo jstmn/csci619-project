@@ -35,7 +35,20 @@ PUSHER_APPROACH_DISTANCE = 0.04
 DEFAULT_PUSH_DISTANCE = 0.10
 PUSHER_KP = 250.0
 PUSHER_KD = 30.0
-PUSHER_MAX_FORCE = 20.0
+PUSHER_MAX_FORCE = 30.0
+
+# JaxSim only supports point-vs-terrain contacts, not body-vs-body, so we add
+# our own analytical spring-damper contact between the pusher and the T block.
+T_PUSHER_CONTACT_K = 2.0e4  # N/m  (~1 mm penetration at 20 N)
+T_PUSHER_CONTACT_D = 80.0  # N·s/m
+PUSHER_EFFECTIVE_RADIUS = PUSHER_RADIUS  # collision radius of the pusher
+
+# T body-frame 2D geometry (xy only; z is ignored because everything lives on the floor).
+# Matches the two collision boxes defined in assets/scene.sdf for link "t_block".
+T_TOP_BAR_CENTER = jnp.array([0.0, 0.10])
+T_TOP_BAR_HALF = jnp.array([0.10, 0.025])
+T_STEM_CENTER = jnp.array([0.0, -0.025])
+T_STEM_HALF = jnp.array([0.025, 0.10])
 
 T_CORNERS = np.array(
     [
@@ -52,6 +65,84 @@ T_CORNERS = np.array(
 )
 FACE_START_POINTS = T_CORNERS[[0, 2, 3, 4, 6, 7]]
 FACE_END_POINTS = T_CORNERS[[1, 3, 4, 5, 7, 0]]
+
+
+def _box_sdf_2d(p: jnp.ndarray, c: jnp.ndarray, h: jnp.ndarray) -> jnp.ndarray:
+    """Signed distance from `p` to an axis-aligned 2D box centered at `c` with half-extents `h`.
+
+    Negative inside, positive outside; differentiable almost everywhere.
+    """
+    q = jnp.abs(p - c) - h
+    outside = jnp.linalg.norm(jnp.maximum(q, 0.0))
+    inside = jnp.minimum(jnp.maximum(q[0], q[1]), 0.0)
+    return outside + inside
+
+
+def _t_sdf(p_body: jnp.ndarray) -> jnp.ndarray:
+    """SDF of the T block (union of top bar + stem) in the block body frame."""
+    sdf_top = _box_sdf_2d(p_body, T_TOP_BAR_CENTER, T_TOP_BAR_HALF)
+    sdf_stem = _box_sdf_2d(p_body, T_STEM_CENTER, T_STEM_HALF)
+    return jnp.minimum(sdf_top, sdf_stem)
+
+
+_t_sdf_value_and_grad = jax.value_and_grad(_t_sdf)
+
+
+def _pusher_t_contact_force_single(
+    pusher_xy: jnp.ndarray,
+    pusher_vel_xy: jnp.ndarray,
+    t_xy: jnp.ndarray,
+    t_vel_xy: jnp.ndarray,
+    t_theta: jnp.ndarray,
+    t_omega: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Penalty spring-damper contact between the pusher and the T block.
+
+    Returns
+    -------
+    F_pusher_world : (2,) force on the pusher in world xy (N)
+    F_t_world      : (2,) force on the T-block in world xy (N)
+    tau_t          : scalar torque on the T-block about +z at the block's joint axis (N·m)
+    """
+    rel_world = pusher_xy - t_xy
+    c = jnp.cos(t_theta)
+    s = jnp.sin(t_theta)
+    R_world_to_body = jnp.array([[c, s], [-s, c]])
+    R_body_to_world = jnp.array([[c, -s], [s, c]])
+    p_body = R_world_to_body @ rel_world
+
+    sdf, grad_body = _t_sdf_value_and_grad(p_body)
+    n_body = grad_body / (jnp.linalg.norm(grad_body) + 1e-12)
+    n_world = R_body_to_world @ n_body
+
+    penetration = jnp.maximum(0.0, PUSHER_EFFECTIVE_RADIUS - sdf)
+
+    # Velocity of the material point of the T that's momentarily at the pusher location.
+    v_t_at_contact = t_vel_xy + t_omega * jnp.array([-rel_world[1], rel_world[0]])
+    v_rel = pusher_vel_xy - v_t_at_contact
+    closing_rate = -jnp.dot(v_rel, n_world)
+
+    # Penalty spring + damping. Damping only applies while penetrating and only
+    # resists closing (never yanks bodies together).
+    is_contact = penetration > 0.0
+    f_mag = jnp.where(
+        is_contact,
+        T_PUSHER_CONTACT_K * penetration + T_PUSHER_CONTACT_D * jnp.maximum(closing_rate, 0.0),
+        0.0,
+    )
+
+    F_pusher_world = f_mag * n_world
+    F_t_world = -F_pusher_world
+    # Torque about +z from applying F_t at the contact point (approximated by the
+    # pusher location relative to the T-joint axis).
+    tau_t = rel_world[0] * F_t_world[1] - rel_world[1] * F_t_world[0]
+
+    return F_pusher_world, F_t_world, tau_t
+
+
+_pusher_t_contact_force_batched = jax.jit(
+    jax.vmap(_pusher_t_contact_force_single, in_axes=(0, 0, 0, 0, 0, 0))
+)
 
 
 # ── Action dataclass ──────────────────────────────────────────────────────────
@@ -507,9 +598,34 @@ class PushTEnv:
                 target_velocity_xy - current_velocity_xy
             )
             pusher_forces = jnp.clip(pusher_forces, -PUSHER_MAX_FORCE, PUSHER_MAX_FORCE)
+
+            # Custom pusher<->T contact penalty (JaxSim does not do body-body contacts).
+            t_xy = jnp.stack(
+                [
+                    self._data.joint_positions[:, self._T_x_idx],
+                    self._data.joint_positions[:, self._T_y_idx],
+                ],
+                axis=-1,
+            )
+            t_vel_xy = jnp.stack(
+                [
+                    self._data.joint_velocities[:, self._T_x_idx],
+                    self._data.joint_velocities[:, self._T_y_idx],
+                ],
+                axis=-1,
+            )
+            t_theta = self._data.joint_positions[:, self._T_theta_idx]
+            t_omega = self._data.joint_velocities[:, self._T_theta_idx]
+            F_pusher_world, F_t_world, tau_t = _pusher_t_contact_force_batched(
+                current_xy, current_velocity_xy, t_xy, t_vel_xy, t_theta, t_omega
+            )
+
             joint_forces = jnp.zeros((self._nenvs, self._model.dofs()))
-            joint_forces = joint_forces.at[:, self._pusher_x_idx].set(pusher_forces[:, 0])
-            joint_forces = joint_forces.at[:, self._pusher_y_idx].set(pusher_forces[:, 1])
+            joint_forces = joint_forces.at[:, self._pusher_x_idx].set(pusher_forces[:, 0] + F_pusher_world[:, 0])
+            joint_forces = joint_forces.at[:, self._pusher_y_idx].set(pusher_forces[:, 1] + F_pusher_world[:, 1])
+            joint_forces = joint_forces.at[:, self._T_x_idx].set(F_t_world[:, 0])
+            joint_forces = joint_forces.at[:, self._T_y_idx].set(F_t_world[:, 1])
+            joint_forces = joint_forces.at[:, self._T_theta_idx].set(tau_t)
             self._data = step_parallel(self._model, self._data, joint_forces)
 
             x = self._data.joint_positions[:, self._T_x_idx]
