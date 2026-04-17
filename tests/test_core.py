@@ -9,7 +9,7 @@ from pusht619.core import Action, PushTEnv
 
 # python -m pytest tests/test_core.py::test_PushTEnv_smoke_test --capture=no
 def test_PushTEnv_smoke_test() -> None:
-    env = PushTEnv(nenvs=9, record_video=True)
+    env = PushTEnv(nenvs=9, record_video=True, visualize=False)
     action = Action(
         face=np.array([0, 1, 2, 3, 4, 5, 0, 1, 2]).reshape(9, 1),
         contact_point=np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]).reshape(9, 1),

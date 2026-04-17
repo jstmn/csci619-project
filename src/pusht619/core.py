@@ -4,17 +4,17 @@ Push-T parallel environment.
 Block state: (x, y, theta) where (x, y) is the link-frame origin in world
 coordinates and theta is the CCW rotation in radians.
 
-Faces (A–F) go around the perimeter of the T; corners p0–p7 are at floor
+Faces (A-F) go around the perimeter of the T; corners p0-p7 are at floor
 level (z = 0) in the body frame defined in the URDF / README.
 """
 
+import copy
 from dataclasses import dataclass
 import pathlib
 import numpy as np
 import functools
-import os
-import time
 from typing import Any
+from lxml import etree
 
 import imageio
 import jax
@@ -153,9 +153,12 @@ class PushTEnv:
     State: (nenvs, 3) array of [x, y, theta] poses.
     """
 
-    def __init__(self, nenvs: int, record_video: bool = False):
+    def __init__(self, nenvs: int, record_video: bool = False, visualize: bool = False):
         self._nenvs = nenvs
         self._record_video = record_video
+        self._visualize = visualize
+        self._visualizer = None
+        self._viewer = None
         self._poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
         self._target_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
         self._frames: list = []
@@ -209,7 +212,45 @@ class PushTEnv:
         )
         
         self.reset()
-        
+
+        if self._visualize:
+            mjcf_string, assets = jaxsim.mujoco.ModelToMjcf.convert(self._model.built_from)
+            parser = etree.XMLParser(remove_blank_text=True)
+            root = etree.fromstring(text=mjcf_string.encode(), parser=parser)
+            worldbody = root.find("worldbody")
+            env_center_original = worldbody.find("body[@name='env_center']")
+            worldbody.remove(env_center_original)
+            for i in range(nenvs):
+                new_body = copy.deepcopy(env_center_original)
+                for el in new_body.iter():
+                    if "name" in el.attrib:
+                        el.set("name", f"{el.get('name')}_{i}")
+                worldbody.append(new_body)
+            actuator = root.find("actuator")
+            if actuator is not None:
+                root.remove(actuator)
+            for light in root.findall(".//light"):
+                if light.get("target") == "env_center":
+                    light.set("target", "env_center_0")
+            for camera in root.findall(".//camera"):
+                if camera.get("target") == "env_center":
+                    camera.set("target", "env_center_0")
+            multi_xml = etree.tostring(root, pretty_print=True).decode()
+            self._mj_multi_model = mj.MjModel.from_xml_string(multi_xml, assets=assets)
+            self._mj_multi_model.opt.gravity[:] = 0.0  # Prevent bodies drifting in MuJoCo physics step
+            self._mj_multi_data = mj.MjData(self._mj_multi_model)
+            self._visualizer = jaxsim.mujoco.MujocoVisualizer(
+                model=self._mj_multi_model, data=self._mj_multi_data
+            )
+            self._viewer = self._visualizer.open_viewer()
+            jaxsim.mujoco.MujocoVisualizer.setup_viewer_camera(
+                self._viewer, lookat=[WORKSPACE_WIDTH/2, WORKSPACE_HEIGHT/2, 0.1], distance=3.0, azimuth=150, elevation=-30
+            )
+            self._sync_visualizer()
+        else:
+            self._visualizer = None
+            self._viewer = None
+
         if record_video:
             mjcf_string, assets = jaxsim.mujoco.ModelToMjcf.convert(
                 self._model.built_from,
@@ -238,6 +279,29 @@ class PushTEnv:
     def nenvs(self) -> int:
         return self._nenvs
 
+    def _sync_visualizer(self) -> None:
+        if self._visualizer is None:
+            return
+            
+        for i in range(self._nenvs):
+            # Update free joint for env_center_i
+            jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, f"world_to_base_{i}")
+            if jnt_id != -1:
+                qpos_adr = self._mj_multi_model.jnt_qposadr[jnt_id]
+                self._mj_multi_data.qpos[qpos_adr : qpos_adr + 3] = self._data.base_position[i]
+                self._mj_multi_data.qpos[qpos_adr + 3 : qpos_adr + 7] = self._data.base_orientation[i]
+            
+            # Update 1D joints
+            for jnt_name in self._model.joint_names():
+                multi_jnt_name = f"{jnt_name}_{i}"
+                multi_jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, multi_jnt_name)
+                if multi_jnt_id != -1:
+                    qpos_adr = self._mj_multi_model.jnt_qposadr[multi_jnt_id]
+                    orig_jnt_idx = self._model.joint_names().index(jnt_name)
+                    self._mj_multi_data.qpos[qpos_adr] = self._data.joint_positions[i, orig_jnt_idx]
+                    
+        self._visualizer.sync(self._viewer)
+
     def reset(self, seed: int = 0) -> np.ndarray:
         """
         Reset all environments to random orientations at the origin.
@@ -261,7 +325,7 @@ class PushTEnv:
         
         # The base is env_center at xy_centers, with identity orientation
         new_base_position = self._data.base_position.at[:, :2].set(self._xy_centers)
-        new_base_position = new_base_position.at[:, 2].set(0.0)
+        new_base_position = new_base_position.at[:, 2].set(0.01)
         
         # Identity quaternions for env_center
         quats = jnp.zeros_like(self._data.base_orientation)
@@ -289,6 +353,7 @@ class PushTEnv:
             joint_velocities=jnp.zeros_like(self._data.joint_velocities),
         )
         self._data = step_parallel(self._model, self._data)
+        self._sync_visualizer()
         
         return self._poses.copy()
 
@@ -331,6 +396,11 @@ class PushTEnv:
                             positions=jpos, joint_names=self._model.joint_names()
                         )
                 self._recorder.record_frame(camera_name="t_block_cam")
+                
+            if self._visualizer is not None:
+                self._sync_visualizer()
+                import time
+                time.sleep(self._model.time_step)
                 
         t_poses = jnp.stack(t_poses_list, axis=1)
         t_distances = jnp.stack(t_distances_list, axis=1)

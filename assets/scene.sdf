@@ -26,30 +26,6 @@
       </inertial>
     </link>
 
-    <!-- Ground plane -->
-    <link name="ground">
-      <inertial>
-        <mass>0.001</mass>
-        <inertia>
-          <ixx>0.001</ixx><iyy>0.001</iyy><izz>0.001</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
-        </inertia>
-      </inertial>
-      <visual name="ground_visual">
-        <geometry>
-          <box><size>10 10 0.01</size></box>
-        </geometry>
-        <material>
-          <ambient>0.9 0.9 0.9 1.0</ambient>
-          <diffuse>0.9 0.9 0.9 1.0</diffuse>
-        </material>
-      </visual>
-    </link>
-    <joint name="ground_joint" type="fixed">
-      <parent>env_center</parent>
-      <child>ground</child>
-      <axis><xyz>0 0 1</xyz></axis>
-    </joint>
-
     <!-- ==================== T-BLOCK ==================== -->
     <link name="t_block_x">
       <inertial>
@@ -138,6 +114,7 @@
 
     <!-- ==================== T-BLOCK - TARGET ==================== -->
     <link name="t_target_block_x">
+      <gravity>false</gravity>
       <inertial>
         <mass>1e-3</mass>
         <inertia>
@@ -152,6 +129,7 @@
     </joint>
 
     <link name="t_target_block_y">
+      <gravity>false</gravity>
       <inertial>
         <mass>1e-3</mass>
         <inertia>
@@ -167,13 +145,14 @@
 
     <link name="t_target_block">
       <pose>0 0 0 0 0 0</pose>
+      <gravity>false</gravity>
       <inertial>
         <pose>0 0.0375 0.025 0 0 0</pose>
-        <mass>0.60</mass>
+        <mass>1e-6</mass>
         <inertia>
-          <ixx>3.531e-3</ixx>
-          <iyy>1.188e-3</iyy>
-          <izz>4.469e-3</izz>
+          <ixx>1e-6</ixx>
+          <iyy>1e-6</iyy>
+          <izz>1e-6</izz>
           <ixy>0</ixy>
           <ixz>0</ixz>
           <iyz>0</iyz>
