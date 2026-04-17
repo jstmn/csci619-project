@@ -1,0 +1,81 @@
+<?xml version="1.0"?>
+<!--
+  Push-T environment: T-shaped block
+  ===================================
+  Large sides : 10 cm  (top-bar length, stem height)
+  Small sides :  5 cm  (bar/stem width and block thickness)
+
+  T shape (top view, z is up):
+    ┌──────────────────────┐  ← top bar  10 cm × 5 cm  (x × y)
+    └─────────┬────────────┘
+              │              stem  5 cm × 5 cm  (x × y)
+              └─────
+
+  Link frame  : center of bounding box  (10 cm × 10 cm × 5 cm)
+                top bar  → y = +2.5 cm from origin
+                stem     → y = −2.5 cm from origin
+                z range  → [−2.5 cm, +2.5 cm]
+
+  To rest on ground plane (z = 0): spawn with z = 0.025 m.
+
+  Inertia: uniform density ρ = 600 kg/m³ (wood-like)
+    m_bar  = 0.15  kg  (0.10 × 0.05 × 0.05 × 600)
+    m_stem = 0.075 kg  (0.05 × 0.05 × 0.05 × 600)
+    M      = 0.225 kg
+    COM_y  = (0.15 × 0.025 − 0.075 × 0.025) / 0.225  =  0.008333 m
+
+  Composite inertia about COM (parallel-axis theorem):
+    Ixx = 2.1875e-4  kg·m²
+    Iyy = 1.8750e-4  kg·m²
+    Izz = 3.1250e-4  kg·m²
+-->
+<robot name="t_block">
+
+  <link name="t_block">
+
+    <!-- Inertial: origin is the center of mass, not the link frame -->
+    <inertial>
+      <origin xyz="0 0.008333 0" rpy="0 0 0"/>
+      <mass value="0.225"/>
+      <inertia
+        ixx="2.1875e-4"  iyy="1.8750e-4"  izz="3.1250e-4"
+        ixy="0"          ixz="0"           iyz="0"/>
+    </inertial>
+
+    <!-- Top bar: 10 cm (x) × 5 cm (y) × 5 cm (z) -->
+    <visual>
+      <origin xyz="0 0.025 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.10 0.05 0.05"/>
+      </geometry>
+      <material name="orange">
+        <color rgba="0.90 0.50 0.10 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.025 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.10 0.05 0.05"/>
+      </geometry>
+    </collision>
+
+    <!-- Vertical stem: 5 cm (x) × 5 cm (y) × 5 cm (z) -->
+    <visual>
+      <origin xyz="0 -0.025 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.05 0.05 0.05"/>
+      </geometry>
+      <material name="orange">
+        <color rgba="0.90 0.50 0.10 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 -0.025 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.05 0.05 0.05"/>
+      </geometry>
+    </collision>
+
+  </link>
+
+</robot>
