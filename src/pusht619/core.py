@@ -63,12 +63,12 @@ PUSHER_EFFECTIVE_RADIUS = PUSHER_RADIUS  # collision radius of the pusher
 T_MASS = 0.6  # kg, matches the SDF <mass> on link t_block
 _GRAVITY_MAG = 9.81
 FRICTION_SCALE = 2.0
-T_FLOOR_MU = FRICTION_SCALE*0.35  # Coulomb coefficient
-T_FLOOR_C_LIN = FRICTION_SCALE*2.0  # N·s/m  (viscous linear)
-T_FLOOR_C_ROT = FRICTION_SCALE*0.02  # N·m·s/rad  (viscous rotational)
+T_FLOOR_MU = FRICTION_SCALE * 0.35  # Coulomb coefficient
+T_FLOOR_C_LIN = FRICTION_SCALE * 2.0  # N·s/m  (viscous linear)
+T_FLOOR_C_ROT = FRICTION_SCALE * 0.02  # N·m·s/rad  (viscous rotational)
 T_FLOOR_V_EPS = 5.0e-3  # m/s   (tanh smoothing: below this, behaves like viscous)
 T_FLOOR_W_EPS = 5.0e-2  # rad/s (tanh smoothing for rotational)
-T_FLOOR_ROT_RADIUS = FRICTION_SCALE*0.086  # m, ≈ sqrt(izz/m) from the SDF (4.469e-3 / 0.6)
+T_FLOOR_ROT_RADIUS = FRICTION_SCALE * 0.086  # m, ≈ sqrt(izz/m) from the SDF (4.469e-3 / 0.6)
 
 # T body-frame 2D geometry (xy only; z is ignored because everything lives on the floor).
 # Matches the two collision boxes defined in assets/scene.sdf for link "t_block".
@@ -97,29 +97,24 @@ _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 
 
 def _plan_push_jax(
-    t_poses: jnp.ndarray,       # (nenvs, 3)  [x, y, theta]
-    face: jnp.ndarray,          # (nenvs,)    int
-    contact_point: jnp.ndarray, # (nenvs,)    float in [0, 1]
-    angle: jnp.ndarray,         # (nenvs,)    float in [0, π]
+    t_poses: jnp.ndarray,  # (nenvs, 3)  [x, y, theta]
+    face: jnp.ndarray,  # (nenvs,)    int
+    contact_point: jnp.ndarray,  # (nenvs,)    float in [0, 1]
+    angle: jnp.ndarray,  # (nenvs,)    float in [0, π]
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """JAX re-implementation of `_plan_push`.
 
     Pure, differentiable w.r.t. `contact_point`, `angle`, and `t_poses`; the
     gradient w.r.t. the integer `face` is zero (gather).
     """
-    face_starts = _FACE_START_POINTS_JAX[face]   # (nenvs, 2)
-    face_ends = _FACE_END_POINTS_JAX[face]        # (nenvs, 2)
+    face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2)
+    face_ends = _FACE_END_POINTS_JAX[face]  # (nenvs, 2)
     face_vectors = face_ends - face_starts
     face_lengths = jnp.linalg.norm(face_vectors, axis=1, keepdims=True)
     face_tangents = face_vectors / face_lengths
-    face_inward_normals = jnp.stack(
-        [face_tangents[:, 1], -face_tangents[:, 0]], axis=-1
-    )
+    face_inward_normals = jnp.stack([face_tangents[:, 1], -face_tangents[:, 0]], axis=-1)
     contact_body = face_starts + contact_point[:, None] * face_vectors
-    push_direction_body = (
-        jnp.cos(angle)[:, None] * face_tangents
-        + jnp.sin(angle)[:, None] * face_inward_normals
-    )
+    push_direction_body = jnp.cos(angle)[:, None] * face_tangents + jnp.sin(angle)[:, None] * face_inward_normals
     cos_theta = jnp.cos(t_poses[:, 2])
     sin_theta = jnp.sin(t_poses[:, 2])
     rotation_matrices = jnp.stack(
@@ -217,9 +212,7 @@ def _pusher_t_contact_force_single(
     return F_pusher_world, F_t_world, tau_t
 
 
-_pusher_t_contact_force_batched = jax.jit(
-    jax.vmap(_pusher_t_contact_force_single, in_axes=(0, 0, 0, 0, 0, 0))
-)
+_pusher_t_contact_force_batched = jax.jit(jax.vmap(_pusher_t_contact_force_single, in_axes=(0, 0, 0, 0, 0, 0)))
 
 
 def _t_floor_friction_single(
@@ -291,17 +284,13 @@ class Action:
             ("contact_point", self.contact_point),
             ("angle", self.angle),
         ):
-            assert isinstance(arr, (np.ndarray, jax.Array)), (
-                f"{name} must be np.ndarray or jax.Array, got {type(arr)}"
-            )
+            assert isinstance(arr, (np.ndarray, jax.Array)), f"{name} must be np.ndarray or jax.Array, got {type(arr)}"
             assert arr.shape == expected_shape, f"{name} must be {expected_shape}, got shape {arr.shape}"
 
         # Only do value-based sanity checks on concrete arrays; skip under a JAX
         # trace (`jax.core.Tracer`), where the values aren't available yet.
         def _is_concrete(x: Any) -> bool:
-            return isinstance(x, np.ndarray) or (
-                isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer)
-            )
+            return isinstance(x, np.ndarray) or (isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer))
 
         if _is_concrete(self.face):
             f = np.asarray(self.face)
@@ -309,9 +298,7 @@ class Action:
             assert np.all((f >= 0) & (f <= 5)), "face must be in {0, …, 5}"
         if _is_concrete(self.contact_point):
             cp = np.asarray(self.contact_point)
-            assert cp.dtype in (np.float32, np.float64), (
-                f"contact_point must be float32/float64, got {cp.dtype}"
-            )
+            assert cp.dtype in (np.float32, np.float64), f"contact_point must be float32/float64, got {cp.dtype}"
             assert np.all((cp >= 0) & (cp <= 1)), "contact_point must be in [0, 1]"
         if _is_concrete(self.angle):
             a = np.asarray(self.angle)
@@ -405,16 +392,16 @@ def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int, int]:
 def _step_pure_impl(
     model: js.model.JaxSimModel,
     data: js.data.JaxSimModelData,
-    face: jnp.ndarray,              # (nenvs,) int
-    contact_point: jnp.ndarray,     # (nenvs,) float in [0, 1]
-    angle: jnp.ndarray,             # (nenvs,) float in [0, π]
-    target_xy: jnp.ndarray,         # (nenvs, 2) float  —  used only to compute t_distances
-    pinned_base_position: jnp.ndarray,        # (nenvs, 3)
-    pinned_base_quaternion: jnp.ndarray,      # (nenvs, 4)
-    pinned_base_linear_velocity: jnp.ndarray,   # (nenvs, 3)
+    face: jnp.ndarray,  # (nenvs,) int
+    contact_point: jnp.ndarray,  # (nenvs,) float in [0, 1]
+    angle: jnp.ndarray,  # (nenvs,) float in [0, π]
+    target_xy: jnp.ndarray,  # (nenvs, 2) float  —  used only to compute t_distances
+    pinned_base_position: jnp.ndarray,  # (nenvs, 3)
+    pinned_base_quaternion: jnp.ndarray,  # (nenvs, 4)
+    pinned_base_linear_velocity: jnp.ndarray,  # (nenvs, 3)
     pinned_base_angular_velocity: jnp.ndarray,  # (nenvs, 3)
-    pinned_joint_positions: jnp.ndarray,        # (nenvs, dofs) — only the "static" columns matter
-    static_joint_mask: jnp.ndarray,             # (dofs,) bool
+    pinned_joint_positions: jnp.ndarray,  # (nenvs, dofs) — only the "static" columns matter
+    static_joint_mask: jnp.ndarray,  # (dofs,) bool
     pusher_x_idx: int,
     pusher_y_idx: int,
     T_x_idx: int,
@@ -443,9 +430,7 @@ def _step_pure_impl(
     T_y = data.joint_positions[:, T_y_idx]
     T_theta = data.joint_positions[:, T_theta_idx]
     t_poses_now = jnp.stack([T_x, T_y, T_theta], axis=-1)
-    pusher_start, pre_contact, push_direction = _plan_push_jax(
-        t_poses_now, face, contact_point, angle
-    )
+    pusher_start, pre_contact, push_direction = _plan_push_jax(t_poses_now, face, contact_point, angle)
 
     # ── Pusher teleport + velocity reset ────────────────────────────────
     jp = data.joint_positions.at[:, pusher_x_idx].set(pusher_start[:, 0])
@@ -464,7 +449,7 @@ def _step_pure_impl(
     push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
 
     if hold_steps > 0:
-        final_target = push_targets[:, -1:, :]                 # (nenvs, 1, 2)
+        final_target = push_targets[:, -1:, :]  # (nenvs, 1, 2)
         hold_targets = jnp.broadcast_to(final_target, (nenvs, hold_steps, 2))
         pusher_targets = jnp.concatenate([approach_targets, push_targets, hold_targets], axis=1)
     else:
@@ -491,9 +476,7 @@ def _step_pure_impl(
             [data.joint_velocities[:, pusher_x_idx], data.joint_velocities[:, pusher_y_idx]],
             axis=-1,
         )
-        pusher_forces = PUSHER_KP * (target_xy_step - cur_xy) + PUSHER_KD * (
-            target_vel_xy - cur_vel_xy
-        )
+        pusher_forces = PUSHER_KP * (target_xy_step - cur_xy) + PUSHER_KD * (target_vel_xy - cur_vel_xy)
         pusher_forces = jnp.clip(pusher_forces, -PUSHER_MAX_FORCE, PUSHER_MAX_FORCE)
 
         t_xy = jnp.stack(
@@ -543,14 +526,14 @@ def _step_pure_impl(
 
     # Scan drives the time dimension first.
     scan_in = (
-        jnp.swapaxes(pusher_targets, 0, 1),              # (n_sim_steps, nenvs, 2)
-        jnp.swapaxes(pusher_target_velocities, 0, 1),    # (n_sim_steps, nenvs, 2)
+        jnp.swapaxes(pusher_targets, 0, 1),  # (n_sim_steps, nenvs, 2)
+        jnp.swapaxes(pusher_target_velocities, 0, 1),  # (n_sim_steps, nenvs, 2)
     )
     data_final, (t_poses_T, t_dists_T, jpos_T) = jax.lax.scan(sim_step, data, scan_in)
 
-    t_poses = jnp.swapaxes(t_poses_T, 0, 1)              # (nenvs, n_sim_steps, 3)
-    t_dists = jnp.swapaxes(t_dists_T, 0, 1)              # (nenvs, n_sim_steps)
-    jpos_traj = jnp.swapaxes(jpos_T, 0, 1)               # (nenvs, n_sim_steps, dofs)
+    t_poses = jnp.swapaxes(t_poses_T, 0, 1)  # (nenvs, n_sim_steps, 3)
+    t_dists = jnp.swapaxes(t_dists_T, 0, 1)  # (nenvs, n_sim_steps)
+    jpos_traj = jnp.swapaxes(jpos_T, 0, 1)  # (nenvs, n_sim_steps, dofs)
     return data_final, t_poses, t_dists, jpos_traj
 
 
@@ -606,9 +589,7 @@ class PushTEnv:
             self._pusher_y_idx,
         }
         dofs = self._model.dofs()
-        static_mask_np = np.array(
-            [i not in active_joint_idxs for i in range(dofs)], dtype=bool
-        )
+        static_mask_np = np.array([i not in active_joint_idxs for i in range(dofs)], dtype=bool)
         self._static_joint_mask = jnp.asarray(static_mask_np)  # (dofs,)
 
         key = jax.random.PRNGKey(seed=0)
@@ -718,9 +699,9 @@ class PushTEnv:
 
     def _sync_visualizer_from_positions(
         self,
-        base_position: np.ndarray,    # (nenvs, 3)
+        base_position: np.ndarray,  # (nenvs, 3)
         base_orientation: np.ndarray,  # (nenvs, 4)
-        joint_positions: np.ndarray,   # (nenvs, dofs)
+        joint_positions: np.ndarray,  # (nenvs, dofs)
     ) -> None:
         if self._visualizer is None:
             return
@@ -820,7 +801,7 @@ class PushTEnv:
         numerical noise accumulate on joints whose soft limits are supposed
         to hold them fixed.
         """
-        mask = self._static_joint_mask[None, :]   # (1, dofs)
+        mask = self._static_joint_mask[None, :]  # (1, dofs)
         jp = jnp.where(mask, self._pinned_joint_positions, data.joint_positions)
         jv = jnp.where(mask, 0.0, data.joint_velocities)
         return data.replace(
@@ -862,9 +843,9 @@ class PushTEnv:
     def step_pure(
         self,
         data: js.data.JaxSimModelData,
-        face: jnp.ndarray,           # (nenvs,) int
+        face: jnp.ndarray,  # (nenvs,) int
         contact_point: jnp.ndarray,  # (nenvs,) float
-        angle: jnp.ndarray,          # (nenvs,) float
+        angle: jnp.ndarray,  # (nenvs,) float
         target_xy: jnp.ndarray | None = None,  # (nenvs, 2) float
         n_sim_steps: int = 100,
     ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -886,9 +867,7 @@ class PushTEnv:
         if target_xy is None:
             target_xy = jnp.asarray(self._target_poses[:, :2])
 
-        approach_steps, push_steps, hold_steps = _compute_phase_steps(
-            float(self._model.time_step), n_sim_steps
-        )
+        approach_steps, push_steps, hold_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
         return _step_pure_impl(
             self._model,
             data,
@@ -923,9 +902,7 @@ class PushTEnv:
         For gradient-based use cases, prefer :py:meth:`step_pure`.
         """
         assert isinstance(action, Action), "action must be an Action"
-        assert action.nenvs == self._nenvs, (
-            f"action.nenvs != self._nenvs ({action.nenvs} != {self._nenvs})"
-        )
+        assert action.nenvs == self._nenvs, f"action.nenvs != self._nenvs ({action.nenvs} != {self._nenvs})"
         assert n_sim_steps > 0, "n_sim_steps must be > 0"
 
         # Extract (nenvs,)-shaped arrays from the Action, tolerating both
@@ -947,7 +924,7 @@ class PushTEnv:
         # ── Post-hoc replay into viz / recorder ────────────────────────
         if self._visualizer is not None or self._record_video:
             # Bring the trajectory to host once; cheap for the shapes we use.
-            jpos_traj_np = np.asarray(jpos_traj)            # (nenvs, n_sim_steps, dofs)
+            jpos_traj_np = np.asarray(jpos_traj)  # (nenvs, n_sim_steps, dofs)
             base_pos_np = np.asarray(self._data.base_position)
             base_quat_np = np.asarray(self._data.base_orientation)
             joint_names = self._model.joint_names()
@@ -968,9 +945,7 @@ class PushTEnv:
 
                 dt_sleep = float(self._model.time_step)
                 for step_idx in range(n_sim_steps):
-                    self._sync_visualizer_from_positions(
-                        base_pos_np, base_quat_np, jpos_traj_np[:, step_idx, :]
-                    )
+                    self._sync_visualizer_from_positions(base_pos_np, base_quat_np, jpos_traj_np[:, step_idx, :])
                     time.sleep(dt_sleep)
 
         return ActionResult(
