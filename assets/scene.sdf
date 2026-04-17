@@ -1,0 +1,281 @@
+<?xml version="1.0"?>
+<!--
+  Push-T environment model (SDF 1.7)
+  ===================================
+  Combines pusher (cylinder) and t_block (T-shaped box compound) into a single
+  model for use with JaxSim.
+
+  To support parallel environments where both the t_block and pusher are actuated
+  independently in world coordinates, we use a dummy root link `env_center`.
+  `t_block` and `pusher_link` are attached via prismatic and continuous joints
+  so they can freely move in X, Y (and Theta for t_block).
+
+  Ground plane at z = 0.
+-->
+<sdf version="1.7">
+  <model name="pusht_env">
+
+    <!-- Canonical root link for the environment (floating base) -->
+    <link name="env_center">
+      <pose>0 0 0 0 0 0</pose>
+      <inertial>
+        <mass>1e-3</mass>
+        <inertia>
+          <ixx>1e-6</ixx><iyy>1e-6</iyy><izz>1e-6</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+    </link>
+
+    <!-- Ground plane -->
+    <link name="ground">
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>0.001</ixx><iyy>0.001</iyy><izz>0.001</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="ground_visual">
+        <geometry>
+          <box><size>10 10 0.01</size></box>
+        </geometry>
+        <material>
+          <ambient>0.9 0.9 0.9 1.0</ambient>
+          <diffuse>0.9 0.9 0.9 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="ground_joint" type="fixed">
+      <parent>env_center</parent>
+      <child>ground</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <!-- ==================== T-BLOCK ==================== -->
+    <link name="t_block_x">
+      <inertial>
+        <mass>1e-3</mass>
+        <inertia>
+          <ixx>1e-6</ixx><iyy>1e-6</iyy><izz>1e-6</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+    </link>
+    <joint name="t_block_joint_x" type="prismatic">
+      <parent>env_center</parent>
+      <child>t_block_x</child>
+      <axis><xyz>1 0 0</xyz></axis>
+    </joint>
+
+    <link name="t_block_y">
+      <inertial>
+        <mass>1e-3</mass>
+        <inertia>
+          <ixx>1e-6</ixx><iyy>1e-6</iyy><izz>1e-6</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+    </link>
+    <joint name="t_block_joint_y" type="prismatic">
+      <parent>t_block_x</parent>
+      <child>t_block_y</child>
+      <axis><xyz>0 1 0</xyz></axis>
+    </joint>
+
+    <link name="t_block">
+      <pose>0 0 0 0 0 0</pose>
+      <inertial>
+        <pose>0 0.0375 0.025 0 0 0</pose>
+        <mass>0.60</mass>
+        <inertia>
+          <ixx>3.531e-3</ixx>
+          <iyy>1.188e-3</iyy>
+          <izz>4.469e-3</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <!-- Top bar -->
+      <collision name="top_bar">
+        <pose>0 0.10 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.20 0.05 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="top_bar_visual">
+        <pose>0 0.10 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.20 0.05 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>0.90 0.50 0.10 1.0</ambient>
+          <diffuse>0.90 0.50 0.10 1.0</diffuse>
+        </material>
+      </visual>
+
+      <!-- Stem -->
+      <collision name="stem">
+        <pose>0 -0.025 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.05 0.20 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="stem_visual">
+        <pose>0 -0.025 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.05 0.20 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>0.90 0.50 0.10 1.0</ambient>
+          <diffuse>0.90 0.50 0.10 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="t_block_joint_theta" type="continuous">
+      <parent>t_block_y</parent>
+      <child>t_block</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <!-- ==================== T-BLOCK - TARGET ==================== -->
+    <link name="t_target_block_x">
+      <inertial>
+        <mass>1e-3</mass>
+        <inertia>
+          <ixx>1e-6</ixx><iyy>1e-6</iyy><izz>1e-6</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+    </link>
+    <joint name="t_target_block_joint_x" type="prismatic">
+      <parent>env_center</parent>
+      <child>t_target_block_x</child>
+      <axis><xyz>1 0 0</xyz></axis>
+    </joint>
+
+    <link name="t_target_block_y">
+      <inertial>
+        <mass>1e-3</mass>
+        <inertia>
+          <ixx>1e-6</ixx><iyy>1e-6</iyy><izz>1e-6</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+    </link>
+    <joint name="t_target_block_joint_y" type="prismatic">
+      <parent>t_target_block_x</parent>
+      <child>t_target_block_y</child>
+      <axis><xyz>0 1 0</xyz></axis>
+    </joint>
+
+    <link name="t_target_block">
+      <pose>0 0 0 0 0 0</pose>
+      <inertial>
+        <pose>0 0.0375 0.025 0 0 0</pose>
+        <mass>0.60</mass>
+        <inertia>
+          <ixx>3.531e-3</ixx>
+          <iyy>1.188e-3</iyy>
+          <izz>4.469e-3</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <!-- Top bar -->
+      <!-- <collision name="top_bar">
+        <pose>0 0.10 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.20 0.05 0.05</size></box>
+        </geometry>
+      </collision> -->
+      <visual name="t_target_top_bar_visual">
+        <pose>0 0.10 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.20 0.05 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.80 0.10 1.0</ambient>
+          <diffuse>0.2 0.80 0.10 1.0</diffuse>
+        </material>
+      </visual>
+
+      <!-- Stem -->
+      <!-- <collision name="stem">
+        <pose>0 -0.025 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.05 0.20 0.05</size></box>
+        </geometry>
+      </collision> -->
+      <visual name="t_target_stem_visual">
+        <pose>0 -0.025 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.05 0.20 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.80 0.10 1.0</ambient>
+          <diffuse>0.2 0.80 0.10 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="t_target_block_joint_theta" type="continuous">
+      <parent>t_target_block_y</parent>
+      <child>t_target_block</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <!-- ==================== PUSHER ==================== -->
+    <link name="pusher_x">
+      <inertial>
+        <mass>1e-3</mass>
+        <inertia>
+          <ixx>1e-6</ixx><iyy>1e-6</iyy><izz>1e-6</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+    </link>
+    <joint name="pusher_joint_x" type="prismatic">
+      <parent>env_center</parent>
+      <child>pusher_x</child>
+      <axis><xyz>1 0 0</xyz></axis>
+    </joint>
+
+    <link name="pusher_link">
+      <pose>0 0 0.025 0 0 0</pose>
+      <inertial>
+        <pose>0 0 0 0 0 0</pose>
+        <mass>0.1</mass>
+        <inertia>
+          <ixx>2.333e-5</ixx>
+          <iyy>2.333e-5</iyy>
+          <izz>5.000e-6</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="pusher_collision">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <box><size>0.02 0.02 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="pusher_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.20 0.40 0.80 1.0</ambient>
+          <diffuse>0.20 0.40 0.80 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="pusher_joint_y" type="prismatic">
+      <parent>pusher_x</parent>
+      <child>pusher_link</child>
+      <axis><xyz>0 1 0</xyz></axis>
+    </joint>
+
+  </model>
+</sdf>

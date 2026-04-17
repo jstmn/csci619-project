@@ -82,6 +82,21 @@ _________________
        |--> +x
 
     |_____|
+
+
+
+
+# World coordinate system:
+
+  |
+  |
+  |
+  | Height: 1.5m
+  |
+  +y
+  ^
+  |--> +x _________________
+  <-    Width: 1.5m      ->
 ```
 
 Note that urdfs can be easily visualized using the [URDF Visualizer](https://marketplace.cursorapi.com/items/?itemName=morningfrog.urdf-visualizer) VSCode extension.

@@ -26,6 +26,10 @@ import mujoco as mj
 import rod
 
 
+T_RADIUS = 0.15
+WORKSPACE_WIDTH = 1.5
+WORKSPACE_HEIGHT = 1.5
+
 
 # ── Action dataclass ──────────────────────────────────────────────────────────
 
@@ -153,18 +157,30 @@ class PushTEnv:
         self._nenvs = nenvs
         self._record_video = record_video
         self._poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
+        self._target_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
         self._frames: list = []
 
-        rod_sdf = rod.Sdf.load(pathlib.Path("assets/t_block.sdf"))
-        rod_sdf.model.switch_frame_convention(
-            frame_convention=rod.FrameConvention.Urdf, explicit_frames=True
-        )
+        rod_sdf = rod.Sdf.load(pathlib.Path("assets/scene.sdf"))
+        for model in rod_sdf.models():
+            model.switch_frame_convention(
+                frame_convention=rod.FrameConvention.Urdf, explicit_frames=True
+            )
         model_sdf_string = rod_sdf.serialize(pretty=True)
 
         self._model = js.model.JaxSimModel.build_from_model_description(
             model_description=model_sdf_string,
             time_step=0.001,
         )
+
+        joint_names = self._model.joint_names()
+        self._T_x_idx = joint_names.index("t_block_joint_x")
+        self._T_y_idx = joint_names.index("t_block_joint_y")
+        self._T_theta_idx = joint_names.index("t_block_joint_theta")
+        self._T_target_x_idx = joint_names.index("t_target_block_joint_x")
+        self._T_target_y_idx = joint_names.index("t_target_block_joint_y")
+        self._T_target_theta_idx = joint_names.index("t_target_block_joint_theta")
+        self._pusher_x_idx = joint_names.index("pusher_joint_x")
+        self._pusher_y_idx = joint_names.index("pusher_joint_y")
 
         key = jax.random.PRNGKey(seed=0)
         key, *subkeys = jax.random.split(key=key, num=nenvs + 1)
@@ -179,10 +195,11 @@ class PushTEnv:
         )(jnp.vstack(subkeys))
 
         row_length = int(jnp.sqrt(nenvs))
-        row_dist = 0.3 * row_length
+        spacing = max(WORKSPACE_WIDTH, WORKSPACE_HEIGHT) * 1.2
+        row_dist = spacing * (row_length - 1) / 2
         x, y = jnp.meshgrid(
-            jnp.linspace(-row_dist, row_dist, num=row_length),
-            jnp.linspace(-row_dist, row_dist, num=row_length),
+            jnp.linspace(-row_dist, row_dist, num=row_length) if row_length > 1 else jnp.array([0.0]),
+            jnp.linspace(-row_dist, row_dist, num=row_length) if row_length > 1 else jnp.array([0.0]),
         )
         xy_coordinate = jnp.stack([x.flatten(), y.flatten()], axis=-1)
         self._xy_centers = np.array(xy_coordinate)
@@ -198,8 +215,8 @@ class PushTEnv:
                 self._model.built_from,
                 cameras=jaxsim.mujoco.loaders.MujocoCamera.build_from_target_view(
                     camera_name="t_block_cam",
-                    lookat=[0, 0, 0.1],
-                    distance=2,
+                    lookat=[0.75, 0.75, 0.1],
+                    distance=3.0,
                     azimuth=150,
                     elevation=-30,
                 ),
@@ -227,29 +244,49 @@ class PushTEnv:
         Returns poses (nenvs, 3).
         """
         rng = np.random.default_rng(seed)
+
+        # First, set randomized poses for the T and target T
+        self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
+        self._target_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+        self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+        self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+        # 
         self._poses = np.zeros((self._nenvs, 3), dtype=np.float64)
+        self._poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+        self._poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
         self._poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+
+        # Reset video frames
         self._frames = []
         
-        # Compute quaternions for rotation around Z
-        half_theta = self._poses[:, 2] / 2.0
-        qw = np.cos(half_theta)
-        qz = np.sin(half_theta)
-        qx = np.zeros_like(qw)
-        qy = np.zeros_like(qw)
-        quats = np.stack([qw, qx, qy, qz], axis=-1)
-        
-        # Compute new base position with XY from centers and Z=0.0
-        new_base_position = self._data.base_position.at[:, :2].set(self._xy_centers + self._poses[:, :2])
+        # The base is env_center at xy_centers, with identity orientation
+        new_base_position = self._data.base_position.at[:, :2].set(self._xy_centers)
         new_base_position = new_base_position.at[:, 2].set(0.0)
+        
+        # Identity quaternions for env_center
+        quats = jnp.zeros_like(self._data.base_orientation)
+        quats = quats.at[:, 0].set(1.0)
+        
+        # Update joint positions for t_block and pusher
+        new_joint_positions = jnp.zeros_like(self._data.joint_positions)
+        new_joint_positions = new_joint_positions.at[:, self._T_x_idx].set(self._poses[:, 0])
+        new_joint_positions = new_joint_positions.at[:, self._T_y_idx].set(self._poses[:, 1])
+        new_joint_positions = new_joint_positions.at[:, self._T_theta_idx].set(self._poses[:, 2])
+        new_joint_positions = new_joint_positions.at[:, self._T_target_x_idx].set(self._target_poses[:, 0])
+        new_joint_positions = new_joint_positions.at[:, self._T_target_y_idx].set(self._target_poses[:, 1])
+        new_joint_positions = new_joint_positions.at[:, self._T_target_theta_idx].set(self._target_poses[:, 2])
+        new_joint_positions = new_joint_positions.at[:, self._pusher_x_idx].set(0.75)
+        new_joint_positions = new_joint_positions.at[:, self._pusher_y_idx].set(0.75)
 
         # Reset internal JaxSim data
         self._data = self._data.replace(
             model=self._model,
             base_position=new_base_position,
-            base_quaternion=jnp.array(quats),
+            base_quaternion=quats,
+            joint_positions=new_joint_positions,
             base_linear_velocity=jnp.zeros_like(self._data._base_linear_velocity),
             base_angular_velocity=jnp.zeros_like(self._data._base_angular_velocity),
+            joint_velocities=jnp.zeros_like(self._data.joint_velocities),
         )
         self._data = step_parallel(self._model, self._data)
         
@@ -271,11 +308,9 @@ class PushTEnv:
         for _ in range(n_sim_steps):
             self._data = step_parallel(self._model, self._data)
             
-            x = self._data.base_position[:, 0] - self._xy_centers[:, 0]
-            y = self._data.base_position[:, 1] - self._xy_centers[:, 1]
-            qw = self._data.base_orientation[:, 0]
-            qz = self._data.base_orientation[:, 3]
-            theta = 2.0 * jnp.arctan2(qz, qw)
+            x = self._data.joint_positions[:, self._T_x_idx]
+            y = self._data.joint_positions[:, self._T_y_idx]
+            theta = self._data.joint_positions[:, self._T_theta_idx]
             
             poses = jnp.stack([x, y, theta], axis=-1)
             t_poses_list.append(poses)

@@ -7,7 +7,7 @@ from pusht619.core import Action, PushTEnv
 
 
 
-# python -m pytest tests/test_core.py::test_PushTEnv_smoke_test
+# python -m pytest tests/test_core.py::test_PushTEnv_smoke_test --capture=no
 def test_PushTEnv_smoke_test() -> None:
     env = PushTEnv(nenvs=9, record_video=True)
     action = Action(
@@ -24,8 +24,11 @@ def test_PushTEnv_smoke_test() -> None:
 
 
     # Next, save a video
-    env.save_video("/tmp/test_PushTEnv_smoke_test.mp4")
-    assert Path("/tmp/test_PushTEnv_smoke_test.mp4").exists()
+    save_filepath = Path("/tmp/test_PushTEnv_smoke_test.mp4")
+    env.save_video(save_filepath)
+    assert save_filepath.exists()
+    print(f"Saved video to {save_filepath}")
+    print(f"xdg-open {save_filepath}")
 
     # Now, reset the environment
     env.reset()
