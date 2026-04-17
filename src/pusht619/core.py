@@ -92,6 +92,56 @@ T_CORNERS = np.array(
 )
 FACE_START_POINTS = T_CORNERS[[0, 2, 3, 4, 6, 7]]
 FACE_END_POINTS = T_CORNERS[[1, 3, 4, 5, 7, 0]]
+_FACE_START_POINTS_JAX = jnp.asarray(FACE_START_POINTS)
+_FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
+
+
+def _plan_push_jax(
+    t_poses: jnp.ndarray,       # (nenvs, 3)  [x, y, theta]
+    face: jnp.ndarray,          # (nenvs,)    int
+    contact_point: jnp.ndarray, # (nenvs,)    float in [0, 1]
+    angle: jnp.ndarray,         # (nenvs,)    float in [0, π]
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """JAX re-implementation of `_plan_push`.
+
+    Pure, differentiable w.r.t. `contact_point`, `angle`, and `t_poses`; the
+    gradient w.r.t. the integer `face` is zero (gather).
+    """
+    face_starts = _FACE_START_POINTS_JAX[face]   # (nenvs, 2)
+    face_ends = _FACE_END_POINTS_JAX[face]        # (nenvs, 2)
+    face_vectors = face_ends - face_starts
+    face_lengths = jnp.linalg.norm(face_vectors, axis=1, keepdims=True)
+    face_tangents = face_vectors / face_lengths
+    face_inward_normals = jnp.stack(
+        [face_tangents[:, 1], -face_tangents[:, 0]], axis=-1
+    )
+    contact_body = face_starts + contact_point[:, None] * face_vectors
+    push_direction_body = (
+        jnp.cos(angle)[:, None] * face_tangents
+        + jnp.sin(angle)[:, None] * face_inward_normals
+    )
+    cos_theta = jnp.cos(t_poses[:, 2])
+    sin_theta = jnp.sin(t_poses[:, 2])
+    rotation_matrices = jnp.stack(
+        [
+            jnp.stack([cos_theta, -sin_theta], axis=-1),
+            jnp.stack([sin_theta, cos_theta], axis=-1),
+        ],
+        axis=1,
+    )
+    contact_world = t_poses[:, :2] + jnp.einsum("nij,nj->ni", rotation_matrices, contact_body)
+    push_direction_world = jnp.einsum("nij,nj->ni", rotation_matrices, push_direction_body)
+    push_direction_world = push_direction_world / jnp.linalg.norm(push_direction_world, axis=1, keepdims=True)
+
+    pre_contact = contact_world - (PUSHER_RADIUS + PUSHER_CLEARANCE) * push_direction_world
+    pusher_start = pre_contact - PUSHER_APPROACH_DISTANCE * push_direction_world
+
+    workspace_margin = PUSHER_RADIUS
+    lb = jnp.array([workspace_margin, workspace_margin])
+    ub = jnp.array([WORKSPACE_WIDTH - workspace_margin, WORKSPACE_HEIGHT - workspace_margin])
+    pusher_start = jnp.clip(pusher_start, lb, ub)
+    pre_contact = jnp.clip(pre_contact, lb, ub)
+    return pusher_start, pre_contact, push_direction_world
 
 
 def _box_sdf_2d(p: jnp.ndarray, c: jnp.ndarray, h: jnp.ndarray) -> jnp.ndarray:
@@ -195,6 +245,9 @@ _t_floor_friction_batched = jax.jit(jax.vmap(_t_floor_friction_single, in_axes=(
 # ── Action dataclass ──────────────────────────────────────────────────────────
 
 
+_ArrayLike = "np.ndarray | jax.Array"
+
+
 @dataclass
 class Action:
     """
@@ -216,45 +269,54 @@ class Action:
         contact_point  float32 in [0, 1]   (0 = start corner, 1 = end corner)
         angle          float32 in [0, π]   (0 = tangent, π/2 = into block)
         push_distance  float32 in [0, 0.1] (metres)
+
+    Arrays may be either `np.ndarray` or `jax.Array`.  The validation runs only
+    under concrete (non-traced) values so that `Action` objects can still be
+    used to carry JAX tracers (e.g. for `jax.grad` or `jax.jit`).
     """
 
-    face: np.ndarray
-    contact_point: np.ndarray
-    angle: np.ndarray
-    # push_distance:  np.ndarray
+    face: Any
+    contact_point: Any
+    angle: Any
+    # push_distance:  Any
 
     @property
     def nenvs(self) -> int:
-        return len(self.face)
+        return self.face.shape[0]
 
     def __post_init__(self):
+        expected_shape = (self.nenvs, 1)
         for name, arr in (
             ("face", self.face),
             ("contact_point", self.contact_point),
             ("angle", self.angle),
-            # ("push_distance", self.push_distance),
         ):
-            assert isinstance(arr, np.ndarray), f"{name} must be np.ndarray"
-            assert arr.shape == (self.nenvs, 1), f"{name} must be (nenvs, 1), got shape {arr.shape}"
+            assert isinstance(arr, (np.ndarray, jax.Array)), (
+                f"{name} must be np.ndarray or jax.Array, got {type(arr)}"
+            )
+            assert arr.shape == expected_shape, f"{name} must be {expected_shape}, got shape {arr.shape}"
 
-        assert self.face.dtype in [np.int32, np.int64], f"face must be int32 or int64, got {self.face.dtype}"
-        assert self.contact_point.dtype in [np.float32, np.float64], (
-            f"contact_point must be float32 or float64, got {self.contact_point.dtype}"
-        )
-        assert self.angle.dtype in [np.float32, np.float64], f"angle must be float32 or float64, got {self.angle.dtype}"
-        # assert self.push_distance.dtype in [np.float32, np.float64], \
-        #     f"push_distance must be float32 or float64, got {self.push_distance.dtype}"
+        # Only do value-based sanity checks on concrete arrays; skip under a JAX
+        # trace (`jax.core.Tracer`), where the values aren't available yet.
+        def _is_concrete(x: Any) -> bool:
+            return isinstance(x, np.ndarray) or (
+                isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer)
+            )
 
-        n = len(self.face)
-        assert len(self.contact_point) == n
-        assert len(self.angle) == n
-        # assert len(self.push_distance) == n
-
-        assert np.all((self.face >= 0) & (self.face <= 5)), "face must be in {0, …, 5}"
-        assert np.all((self.contact_point >= 0) & (self.contact_point <= 1)), "contact_point must be in [0, 1]"
-        assert np.all((self.angle >= 0) & (self.angle <= np.pi)), "angle must be in [0, π]"
-        # assert np.all((self.push_distance >= 0) & (self.push_distance <= 0.1)), \
-        #     "push_distance must be in [0, 0.1]"
+        if _is_concrete(self.face):
+            f = np.asarray(self.face)
+            assert f.dtype in (np.int32, np.int64), f"face must be int32/int64, got {f.dtype}"
+            assert np.all((f >= 0) & (f <= 5)), "face must be in {0, …, 5}"
+        if _is_concrete(self.contact_point):
+            cp = np.asarray(self.contact_point)
+            assert cp.dtype in (np.float32, np.float64), (
+                f"contact_point must be float32/float64, got {cp.dtype}"
+            )
+            assert np.all((cp >= 0) & (cp <= 1)), "contact_point must be in [0, 1]"
+        if _is_concrete(self.angle):
+            a = np.asarray(self.angle)
+            assert a.dtype in (np.float32, np.float64), f"angle must be float32/float64, got {a.dtype}"
+            assert np.all((a >= 0) & (a <= np.pi)), "angle must be in [0, π]"
 
 
 @dataclass
@@ -310,6 +372,179 @@ def step_parallel(
         data=data,
         joint_force_references=joint_force_references,
     )
+
+
+def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int, int]:
+    """Split `n_sim_steps` between approach / push / hold phases.
+
+    Returned values are concrete Python ints so they can be used as static
+    shapes inside a jit'd function (needed for `jnp.linspace(..., num=N)`).
+    """
+    approach_full = max(1, int(round(PUSHER_APPROACH_DISTANCE / (PUSHER_APPROACH_VELOCITY * dt))))
+    push_full = max(1, int(round(DEFAULT_PUSH_DISTANCE / (PUSHER_PUSH_VELOCITY * dt))))
+    approach_steps = min(approach_full, n_sim_steps)
+    push_steps = min(push_full, n_sim_steps - approach_steps)
+    hold_steps = n_sim_steps - approach_steps - push_steps
+    return approach_steps, push_steps, hold_steps
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "approach_steps",
+        "push_steps",
+        "hold_steps",
+        "pusher_x_idx",
+        "pusher_y_idx",
+        "T_x_idx",
+        "T_y_idx",
+        "T_theta_idx",
+        "nenvs",
+    ),
+)
+def _step_pure_impl(
+    model: js.model.JaxSimModel,
+    data: js.data.JaxSimModelData,
+    face: jnp.ndarray,              # (nenvs,) int
+    contact_point: jnp.ndarray,     # (nenvs,) float in [0, 1]
+    angle: jnp.ndarray,             # (nenvs,) float in [0, π]
+    target_xy: jnp.ndarray,         # (nenvs, 2) float  —  used only to compute t_distances
+    pinned_base_position: jnp.ndarray,        # (nenvs, 3)
+    pinned_base_quaternion: jnp.ndarray,      # (nenvs, 4)
+    pinned_base_linear_velocity: jnp.ndarray,   # (nenvs, 3)
+    pinned_base_angular_velocity: jnp.ndarray,  # (nenvs, 3)
+    pusher_x_idx: int,
+    pusher_y_idx: int,
+    T_x_idx: int,
+    T_y_idx: int,
+    T_theta_idx: int,
+    nenvs: int,
+    approach_steps: int,
+    push_steps: int,
+    hold_steps: int,
+) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Fully pure, jittable, differentiable physics rollout for one action.
+
+    Returns
+    -------
+    data_new : `JaxSimModelData` at the end of the rollout.
+    t_poses  : (nenvs, n_sim_steps, 3) the T pose at every sim step.
+    t_dists  : (nenvs, n_sim_steps) Euclidean xy distance from T to `target_xy`.
+    jpos_traj: (nenvs, n_sim_steps, dofs) full joint position trace — useful
+               only for replay into the visualizer / recorder; do NOT touch
+               this when computing gradients (it's large and mostly redundant).
+    """
+    dt = model.time_step
+
+    # ── Planning (all jnp) ─────────────────────────────────────────────
+    T_x = data.joint_positions[:, T_x_idx]
+    T_y = data.joint_positions[:, T_y_idx]
+    T_theta = data.joint_positions[:, T_theta_idx]
+    t_poses_now = jnp.stack([T_x, T_y, T_theta], axis=-1)
+    pusher_start, pre_contact, push_direction = _plan_push_jax(
+        t_poses_now, face, contact_point, angle
+    )
+
+    # ── Pusher teleport + velocity reset ────────────────────────────────
+    jp = data.joint_positions.at[:, pusher_x_idx].set(pusher_start[:, 0])
+    jp = jp.at[:, pusher_y_idx].set(pusher_start[:, 1])
+    jv = data.joint_velocities.at[:, pusher_x_idx].set(0.0)
+    jv = jv.at[:, pusher_y_idx].set(0.0)
+    data = data.replace(model=model, joint_positions=jp, joint_velocities=jv)
+
+    # ── Build pusher target trajectory ─────────────────────────────────
+    approach_scales = jnp.linspace(0.0, 1.0, num=approach_steps)
+    push_scales = jnp.linspace(0.0, DEFAULT_PUSH_DISTANCE, num=push_steps)
+
+    approach_targets = (
+        pusher_start[:, None, :] + approach_scales[None, :, None] * (pre_contact - pusher_start)[:, None, :]
+    )
+    push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
+
+    if hold_steps > 0:
+        final_target = push_targets[:, -1:, :]                 # (nenvs, 1, 2)
+        hold_targets = jnp.broadcast_to(final_target, (nenvs, hold_steps, 2))
+        pusher_targets = jnp.concatenate([approach_targets, push_targets, hold_targets], axis=1)
+    else:
+        pusher_targets = jnp.concatenate([approach_targets, push_targets], axis=1)
+
+    workspace_margin = PUSHER_RADIUS
+    lb = jnp.array([workspace_margin, workspace_margin])
+    ub = jnp.array([WORKSPACE_WIDTH - workspace_margin, WORKSPACE_HEIGHT - workspace_margin])
+    pusher_targets = jnp.clip(pusher_targets, lb, ub)
+
+    pusher_target_velocities = jnp.zeros_like(pusher_targets)
+    pusher_target_velocities = pusher_target_velocities.at[:, 1:, :].set(
+        (pusher_targets[:, 1:, :] - pusher_targets[:, :-1, :]) / dt
+    )
+
+    # ── Scan body: one sim step ─────────────────────────────────────────
+    def sim_step(data: js.data.JaxSimModelData, step_input):
+        target_xy_step, target_vel_xy = step_input  # each (nenvs, 2)
+        cur_xy = jnp.stack(
+            [data.joint_positions[:, pusher_x_idx], data.joint_positions[:, pusher_y_idx]],
+            axis=-1,
+        )
+        cur_vel_xy = jnp.stack(
+            [data.joint_velocities[:, pusher_x_idx], data.joint_velocities[:, pusher_y_idx]],
+            axis=-1,
+        )
+        pusher_forces = PUSHER_KP * (target_xy_step - cur_xy) + PUSHER_KD * (
+            target_vel_xy - cur_vel_xy
+        )
+        pusher_forces = jnp.clip(pusher_forces, -PUSHER_MAX_FORCE, PUSHER_MAX_FORCE)
+
+        t_xy = jnp.stack(
+            [data.joint_positions[:, T_x_idx], data.joint_positions[:, T_y_idx]],
+            axis=-1,
+        )
+        t_vel_xy = jnp.stack(
+            [data.joint_velocities[:, T_x_idx], data.joint_velocities[:, T_y_idx]],
+            axis=-1,
+        )
+        t_theta = data.joint_positions[:, T_theta_idx]
+        t_omega = data.joint_velocities[:, T_theta_idx]
+
+        F_pusher_world, F_t_world, tau_t = jax.vmap(_pusher_t_contact_force_single)(
+            cur_xy, cur_vel_xy, t_xy, t_vel_xy, t_theta, t_omega
+        )
+        F_fric_world, tau_fric = jax.vmap(_t_floor_friction_single)(t_vel_xy, t_omega)
+
+        joint_forces = jnp.zeros_like(data.joint_velocities)
+        joint_forces = joint_forces.at[:, pusher_x_idx].set(pusher_forces[:, 0] + F_pusher_world[:, 0])
+        joint_forces = joint_forces.at[:, pusher_y_idx].set(pusher_forces[:, 1] + F_pusher_world[:, 1])
+        joint_forces = joint_forces.at[:, T_x_idx].set(F_t_world[:, 0] + F_fric_world[:, 0])
+        joint_forces = joint_forces.at[:, T_y_idx].set(F_t_world[:, 1] + F_fric_world[:, 1])
+        joint_forces = joint_forces.at[:, T_theta_idx].set(tau_t + tau_fric)
+
+        data = step_parallel(model, data, joint_forces)
+        data = data.replace(
+            model=model,
+            base_position=pinned_base_position,
+            base_quaternion=pinned_base_quaternion,
+            base_linear_velocity=pinned_base_linear_velocity,
+            base_angular_velocity=pinned_base_angular_velocity,
+        )
+
+        tx = data.joint_positions[:, T_x_idx]
+        ty = data.joint_positions[:, T_y_idx]
+        tth = data.joint_positions[:, T_theta_idx]
+        t_pose = jnp.stack([tx, ty, tth], axis=-1)
+        t_dist = jnp.linalg.norm(t_pose[:, :2] - target_xy, axis=-1)
+
+        return data, (t_pose, t_dist, data.joint_positions)
+
+    # Scan drives the time dimension first.
+    scan_in = (
+        jnp.swapaxes(pusher_targets, 0, 1),              # (n_sim_steps, nenvs, 2)
+        jnp.swapaxes(pusher_target_velocities, 0, 1),    # (n_sim_steps, nenvs, 2)
+    )
+    data_final, (t_poses_T, t_dists_T, jpos_T) = jax.lax.scan(sim_step, data, scan_in)
+
+    t_poses = jnp.swapaxes(t_poses_T, 0, 1)              # (nenvs, n_sim_steps, 3)
+    t_dists = jnp.swapaxes(t_dists_T, 0, 1)              # (nenvs, n_sim_steps)
+    jpos_traj = jnp.swapaxes(jpos_T, 0, 1)               # (nenvs, n_sim_steps, dofs)
+    return data_final, t_poses, t_dists, jpos_traj
 
 
 class PushTEnv:
@@ -446,75 +681,36 @@ class PushTEnv:
     def nenvs(self) -> int:
         return self._nenvs
 
-    def _current_t_poses(self) -> np.ndarray:
-        return np.column_stack(
-            [
-                np.asarray(self._data.joint_positions[:, self._T_x_idx]),
-                np.asarray(self._data.joint_positions[:, self._T_y_idx]),
-                np.asarray(self._data.joint_positions[:, self._T_theta_idx]),
-            ]
-        )
-
-    def _plan_push(self, action: Action) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        poses = self._current_t_poses()
-        face = action.face[:, 0]
-        contact_point = action.contact_point[:, 0]
-        angle = action.angle[:, 0]
-        face_starts = FACE_START_POINTS[face]
-        face_ends = FACE_END_POINTS[face]
-        face_vectors = face_ends - face_starts
-        face_lengths = np.linalg.norm(face_vectors, axis=1, keepdims=True)
-        face_tangents = face_vectors / face_lengths
-        face_inward_normals = np.column_stack([face_tangents[:, 1], -face_tangents[:, 0]])
-        contact_body = face_starts + contact_point[:, None] * face_vectors
-        push_direction_body = np.cos(angle)[:, None] * face_tangents + np.sin(angle)[:, None] * face_inward_normals
-        cos_theta = np.cos(poses[:, 2])
-        sin_theta = np.sin(poses[:, 2])
-        rotation_matrices = np.stack(
-            [
-                np.stack([cos_theta, -sin_theta], axis=-1),
-                np.stack([sin_theta, cos_theta], axis=-1),
-            ],
-            axis=1,
-        )
-        contact_world = poses[:, :2] + np.einsum("nij,nj->ni", rotation_matrices, contact_body)
-        push_direction_world = np.einsum("nij,nj->ni", rotation_matrices, push_direction_body)
-        push_direction_world /= np.linalg.norm(push_direction_world, axis=1, keepdims=True)
-        pre_contact = contact_world - (PUSHER_RADIUS + PUSHER_CLEARANCE) * push_direction_world
-        pusher_start = pre_contact - PUSHER_APPROACH_DISTANCE * push_direction_world
-        workspace_margin = PUSHER_RADIUS
-        pusher_start = np.clip(
-            pusher_start,
-            workspace_margin,
-            np.array([WORKSPACE_WIDTH, WORKSPACE_HEIGHT]) - workspace_margin,
-        )
-        pre_contact = np.clip(
-            pre_contact,
-            workspace_margin,
-            np.array([WORKSPACE_WIDTH, WORKSPACE_HEIGHT]) - workspace_margin,
-        )
-        return pusher_start, pre_contact, push_direction_world
-
     def _sync_visualizer(self) -> None:
         if self._visualizer is None:
             return
+        self._sync_visualizer_from_positions(
+            base_position=np.asarray(self._data.base_position),
+            base_orientation=np.asarray(self._data.base_orientation),
+            joint_positions=np.asarray(self._data.joint_positions),
+        )
+
+    def _sync_visualizer_from_positions(
+        self,
+        base_position: np.ndarray,    # (nenvs, 3)
+        base_orientation: np.ndarray,  # (nenvs, 4)
+        joint_positions: np.ndarray,   # (nenvs, dofs)
+    ) -> None:
+        if self._visualizer is None:
+            return
+        joint_names = self._model.joint_names()
         for i in range(self._nenvs):
-            # Update free joint for env_center_i
             jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, f"world_to_base_{i}")
             if jnt_id != -1:
                 qpos_adr = self._mj_multi_model.jnt_qposadr[jnt_id]
-                self._mj_multi_data.qpos[qpos_adr : qpos_adr + 3] = self._data.base_position[i]
-                self._mj_multi_data.qpos[qpos_adr + 3 : qpos_adr + 7] = self._data.base_orientation[i]
-
-            # Update 1D joints
-            for jnt_name in self._model.joint_names():
+                self._mj_multi_data.qpos[qpos_adr : qpos_adr + 3] = base_position[i]
+                self._mj_multi_data.qpos[qpos_adr + 3 : qpos_adr + 7] = base_orientation[i]
+            for orig_jnt_idx, jnt_name in enumerate(joint_names):
                 multi_jnt_name = f"{jnt_name}_{i}"
                 multi_jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, multi_jnt_name)
                 if multi_jnt_id != -1:
                     qpos_adr = self._mj_multi_model.jnt_qposadr[multi_jnt_id]
-                    orig_jnt_idx = self._model.joint_names().index(jnt_name)
-                    self._mj_multi_data.qpos[qpos_adr] = self._data.joint_positions[i, orig_jnt_idx]
-
+                    self._mj_multi_data.qpos[qpos_adr] = joint_positions[i, orig_jnt_idx]
         self._visualizer.sync(self._viewer)
 
     def reset(self, seed: int = 0) -> np.ndarray:
@@ -578,7 +774,13 @@ class PushTEnv:
         zero_forces = jnp.zeros((self._nenvs, self._model.dofs()))
         self._data = step_parallel(self._model, self._data, zero_forces)
         self._data = self._pin_base(self._data)
-        self._poses = self._current_t_poses()
+        self._poses = np.column_stack(
+            [
+                np.asarray(self._data.joint_positions[:, self._T_x_idx]),
+                np.asarray(self._data.joint_positions[:, self._T_y_idx]),
+                np.asarray(self._data.joint_positions[:, self._T_theta_idx]),
+            ]
+        )
         self._sync_visualizer()
         return self._poses.copy()
 
@@ -596,165 +798,171 @@ class PushTEnv:
             base_angular_velocity=self._pinned_base_angular_velocity,
         )
 
-    def step(self, action: Action, n_sim_steps: int = 10) -> ActionResult:
-        """
-        Apply actions to all environments. Returns ActionResult.
+    # ── Pure, differentiable step ────────────────────────────────────────
+    #
+    # The recommended entry-point for gradient-based optimization.
+    #
+    # Example — take the gradient of a final-distance cost w.r.t. the action:
+    #
+    #     env = PushTEnv(nenvs=N)
+    #     env.reset()
+    #     data0 = env.data                      # snapshot the initial JaxSim state
+    #     target_xy = env.target_poses[:, :2]
+    #
+    #     def cost(contact_point, angle, face):
+    #         _, _, t_dists, _ = env.step_pure(
+    #             data0, face, contact_point, angle, target_xy, n_sim_steps=100
+    #         )
+    #         # Cost = distance-to-target at the final sim step, summed over envs
+    #         return t_dists[:, -1].sum()
+    #
+    #     g_contact, g_angle = jax.grad(cost, argnums=(0, 1))(
+    #         contact_point, angle, face
+    #     )
+    #
+    # `face` is an integer index — `jax.grad` will return zeros for it.
+    # `step_pure` is pure and has *no* side-effects: it does not touch
+    # `self._data`, the visualizer, or the recorder.
 
-        For now, ignores the push_distance value, and simply takes the action for n_sim_steps.
+    def step_pure(
+        self,
+        data: js.data.JaxSimModelData,
+        face: jnp.ndarray,           # (nenvs,) int
+        contact_point: jnp.ndarray,  # (nenvs,) float
+        angle: jnp.ndarray,          # (nenvs,) float
+        target_xy: jnp.ndarray | None = None,  # (nenvs, 2) float
+        n_sim_steps: int = 100,
+    ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Pure, jittable, differentiable single-action rollout.
+
+        Returns ``(data_new, t_poses, t_distances, joint_positions_traj)`` —
+        all JAX arrays.  Shapes:
+
+        - ``t_poses``  : (nenvs, n_sim_steps, 3)
+        - ``t_distances`` : (nenvs, n_sim_steps)
+        - ``joint_positions_traj`` : (nenvs, n_sim_steps, dofs)
+
+        Use this when you want to take gradients (e.g. ``jax.grad``) through
+        a full 100-step rollout.  The ``face`` argument is an integer index
+        and carries zero gradient; differentiate w.r.t. ``contact_point`` and
+        ``angle`` (and optionally fields of ``data``).
         """
-        # TODO: removed n_sim_steps and use push_distance
+        assert n_sim_steps > 0, "n_sim_steps must be > 0"
+        if target_xy is None:
+            target_xy = jnp.asarray(self._target_poses[:, :2])
+
+        approach_steps, push_steps, hold_steps = _compute_phase_steps(
+            float(self._model.time_step), n_sim_steps
+        )
+        return _step_pure_impl(
+            self._model,
+            data,
+            jnp.asarray(face).astype(jnp.int32),
+            jnp.asarray(contact_point).astype(jnp.float64),
+            jnp.asarray(angle).astype(jnp.float64),
+            jnp.asarray(target_xy).astype(jnp.float64),
+            self._pinned_base_position,
+            self._pinned_base_quaternion,
+            self._pinned_base_linear_velocity,
+            self._pinned_base_angular_velocity,
+            self._pusher_x_idx,
+            self._pusher_y_idx,
+            self._T_x_idx,
+            self._T_y_idx,
+            self._T_theta_idx,
+            self._nenvs,
+            approach_steps,
+            push_steps,
+            hold_steps,
+        )
+
+    def step(self, action: Action, n_sim_steps: int = 100) -> ActionResult:
+        """
+        Stateful wrapper around :py:meth:`step_pure`.  Advances the internal
+        simulation state by one action, handles visualization and video
+        recording (as post-hoc replays of the trajectory), and returns an
+        ``ActionResult`` with NumPy arrays for convenience.
+
+        For gradient-based use cases, prefer :py:meth:`step_pure`.
+        """
         assert isinstance(action, Action), "action must be an Action"
-        assert action.nenvs == self._nenvs, f"action.nenvs != self._nenvs ({action.nenvs} != {self._nenvs})"
-        assert n_sim_steps > 0, "n_sim_steps must be greater than 0"
-
-        pusher_start, pre_contact, push_direction = self._plan_push(action)
-        initial_joint_positions = self._data.joint_positions
-        initial_joint_velocities = self._data.joint_velocities
-        joint_positions = initial_joint_positions.at[:, self._pusher_x_idx].set(pusher_start[:, 0])
-        joint_positions = joint_positions.at[:, self._pusher_y_idx].set(pusher_start[:, 1])
-        joint_velocities = initial_joint_velocities.at[:, self._pusher_x_idx].set(0.0)
-        joint_velocities = joint_velocities.at[:, self._pusher_y_idx].set(0.0)
-        self._data = self._data.replace(
-            model=self._model, joint_positions=joint_positions, joint_velocities=joint_velocities
+        assert action.nenvs == self._nenvs, (
+            f"action.nenvs != self._nenvs ({action.nenvs} != {self._nenvs})"
         )
+        assert n_sim_steps > 0, "n_sim_steps must be > 0"
 
-        dt = self._model.time_step
-        # Fixed target velocities -> step counts independent of n_sim_steps.
-        approach_steps_full = max(1, int(round(PUSHER_APPROACH_DISTANCE / (PUSHER_APPROACH_VELOCITY * dt))))
-        push_steps_full = max(1, int(round(DEFAULT_PUSH_DISTANCE / (PUSHER_PUSH_VELOCITY * dt))))
-        # Clip so approach + push fits within n_sim_steps; any remainder is "hold".
-        approach_steps = min(approach_steps_full, n_sim_steps)
-        push_steps = min(push_steps_full, n_sim_steps - approach_steps)
-        hold_steps = n_sim_steps - approach_steps - push_steps
+        # Extract (nenvs,)-shaped arrays from the Action, tolerating both
+        # np.ndarray and jax.Array inputs.
+        face = jnp.asarray(np.asarray(action.face)[:, 0]).astype(jnp.int32)
+        contact_point = jnp.asarray(np.asarray(action.contact_point)[:, 0]).astype(jnp.float64)
+        angle = jnp.asarray(np.asarray(action.angle)[:, 0]).astype(jnp.float64)
 
-        approach_scales = np.linspace(0.0, 1.0, num=approach_steps, endpoint=True, dtype=np.float64)
-        push_scales = np.linspace(
-            0.0,
-            DEFAULT_PUSH_DISTANCE,
-            num=push_steps,
-            endpoint=True,
-            dtype=np.float64,
+        self._data, t_poses, t_distances, jpos_traj = self.step_pure(
+            data=self._data,
+            face=face,
+            contact_point=contact_point,
+            angle=angle,
+            target_xy=jnp.asarray(self._target_poses[:, :2]),
+            n_sim_steps=n_sim_steps,
         )
-        approach_targets = (
-            pusher_start[:, None, :] + approach_scales[None, :, None] * (pre_contact - pusher_start)[:, None, :]
-        )
-        push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
-        pusher_targets = np.concatenate([approach_targets, push_targets], axis=1)
-        if hold_steps > 0:
-            final_target = pusher_targets[:, -1:, :]
-            hold_targets = np.broadcast_to(final_target, (self._nenvs, hold_steps, 2)).copy()
-            pusher_targets = np.concatenate([pusher_targets, hold_targets], axis=1)
-        pusher_targets = pusher_targets[:, :n_sim_steps, :]
-        workspace_margin = PUSHER_RADIUS
-        pusher_targets = np.clip(
-            pusher_targets,
-            workspace_margin,
-            np.array([WORKSPACE_WIDTH, WORKSPACE_HEIGHT]) - workspace_margin,
-        )
-        pusher_target_velocities = np.zeros_like(pusher_targets)
-        pusher_target_velocities[:, 1:, :] = (pusher_targets[:, 1:, :] - pusher_targets[:, :-1, :]) / dt
+        self._poses = np.asarray(t_poses[:, -1, :])
 
-        t_poses_list = []
-        t_distances_list = []
-
-        for step_idx in range(n_sim_steps):
-            target_xy = jnp.asarray(pusher_targets[:, step_idx, :])
-            target_velocity_xy = jnp.asarray(pusher_target_velocities[:, step_idx, :])
-            current_xy = jnp.stack(
-                [
-                    self._data.joint_positions[:, self._pusher_x_idx],
-                    self._data.joint_positions[:, self._pusher_y_idx],
-                ],
-                axis=-1,
-            )
-            current_velocity_xy = jnp.stack(
-                [
-                    self._data.joint_velocities[:, self._pusher_x_idx],
-                    self._data.joint_velocities[:, self._pusher_y_idx],
-                ],
-                axis=-1,
-            )
-
-            pusher_forces = PUSHER_KP * (target_xy - current_xy) + PUSHER_KD * (
-                target_velocity_xy - current_velocity_xy
-            )
-            pusher_forces = jnp.clip(pusher_forces, -PUSHER_MAX_FORCE, PUSHER_MAX_FORCE)
-
-            # Custom pusher<->T contact penalty (JaxSim does not do body-body contacts).
-            t_xy = jnp.stack(
-                [
-                    self._data.joint_positions[:, self._T_x_idx],
-                    self._data.joint_positions[:, self._T_y_idx],
-                ],
-                axis=-1,
-            )
-            t_vel_xy = jnp.stack(
-                [
-                    self._data.joint_velocities[:, self._T_x_idx],
-                    self._data.joint_velocities[:, self._T_y_idx],
-                ],
-                axis=-1,
-            )
-            t_theta = self._data.joint_positions[:, self._T_theta_idx]
-            t_omega = self._data.joint_velocities[:, self._T_theta_idx]
-            F_pusher_world, F_t_world, tau_t = _pusher_t_contact_force_batched(
-                current_xy, current_velocity_xy, t_xy, t_vel_xy, t_theta, t_omega
-            )
-
-            # Floor friction on the T-block (Coulomb + viscous).
-            F_fric_world, tau_fric = _t_floor_friction_batched(t_vel_xy, t_omega)
-
-            joint_forces = jnp.zeros((self._nenvs, self._model.dofs()))
-            joint_forces = joint_forces.at[:, self._pusher_x_idx].set(pusher_forces[:, 0] + F_pusher_world[:, 0])
-            joint_forces = joint_forces.at[:, self._pusher_y_idx].set(pusher_forces[:, 1] + F_pusher_world[:, 1])
-            joint_forces = joint_forces.at[:, self._T_x_idx].set(F_t_world[:, 0] + F_fric_world[:, 0])
-            joint_forces = joint_forces.at[:, self._T_y_idx].set(F_t_world[:, 1] + F_fric_world[:, 1])
-            joint_forces = joint_forces.at[:, self._T_theta_idx].set(tau_t + tau_fric)
-            self._data = step_parallel(self._model, self._data, joint_forces)
-            self._data = self._pin_base(self._data)
-
-            x = self._data.joint_positions[:, self._T_x_idx]
-            y = self._data.joint_positions[:, self._T_y_idx]
-            theta = self._data.joint_positions[:, self._T_theta_idx]
-
-            poses = jnp.stack([x, y, theta], axis=-1)
-            t_poses_list.append(poses)
-            target_xy_error = poses[:, :2] - jnp.asarray(self._target_poses[:, :2])
-            t_distances_list.append(jnp.linalg.norm(target_xy_error, axis=-1))
+        # ── Post-hoc replay into viz / recorder ────────────────────────
+        if self._visualizer is not None or self._record_video:
+            # Bring the trajectory to host once; cheap for the shapes we use.
+            jpos_traj_np = np.asarray(jpos_traj)            # (nenvs, n_sim_steps, dofs)
+            base_pos_np = np.asarray(self._data.base_position)
+            base_quat_np = np.asarray(self._data.base_orientation)
+            joint_names = self._model.joint_names()
 
             if self._record_video:
-                for helper, pos, quat, jpos in zip(
-                    self._mj_model_helpers,
-                    self._data.base_position,
-                    self._data.base_orientation,
-                    self._data.joint_positions,
-                    strict=True,
-                ):
-                    helper.set_base_position(position=pos)
-                    helper.set_base_orientation(orientation=quat)
-                    helper.set_joint_positions(positions=jpos, joint_names=self._model.joint_names())
-                self._recorder.record_frame(camera_name="t_block_cam")
+                for step_idx in range(n_sim_steps):
+                    for env_idx, helper in enumerate(self._mj_model_helpers):
+                        helper.set_base_position(position=base_pos_np[env_idx])
+                        helper.set_base_orientation(orientation=base_quat_np[env_idx])
+                        helper.set_joint_positions(
+                            positions=jpos_traj_np[env_idx, step_idx],
+                            joint_names=joint_names,
+                        )
+                    self._recorder.record_frame(camera_name="t_block_cam")
 
             if self._visualizer is not None:
-                self._sync_visualizer()
                 import time
 
-                time.sleep(self._model.time_step)
-
-        t_poses = jnp.stack(t_poses_list, axis=1)
-        t_distances = jnp.stack(t_distances_list, axis=1)
-        self._poses = np.array(t_poses[:, -1, :])
+                dt_sleep = float(self._model.time_step)
+                for step_idx in range(n_sim_steps):
+                    self._sync_visualizer_from_positions(
+                        base_pos_np, base_quat_np, jpos_traj_np[:, step_idx, :]
+                    )
+                    time.sleep(dt_sleep)
 
         return ActionResult(
             action=action,
-            t_poses=np.array(t_poses),
-            t_distances=np.array(t_distances),
+            t_poses=np.asarray(t_poses),
+            t_distances=np.asarray(t_distances),
         )
 
     @property
     def poses(self) -> np.ndarray:
         """Current poses (nenvs, 3) — read-only copy."""
         return self._poses.copy()
+
+    @property
+    def target_poses(self) -> np.ndarray:
+        """Target poses (nenvs, 3) — read-only copy."""
+        return self._target_poses.copy()
+
+    @property
+    def data(self) -> js.data.JaxSimModelData:
+        """Current `JaxSimModelData` — pass this to :py:meth:`step_pure` when
+        you want to differentiate through a rollout starting from the current
+        simulation state.
+        """
+        return self._data
+
+    @property
+    def model(self) -> js.model.JaxSimModel:
+        return self._model
 
     def render(self) -> None:
         pass
