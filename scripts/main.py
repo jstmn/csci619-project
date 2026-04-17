@@ -12,7 +12,7 @@ python scripts/main.py
 if __name__ == "__main__":
     env = PushTEnv(nenvs=9, record_video=True, visualize=True)
 
-    for i in range(100):
+    for i in range(10):
         print(f"Step {i}")
         action = Action(
             face=np.random.randint(0, 6, size=(9, 1)),
