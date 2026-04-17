@@ -413,6 +413,8 @@ def _step_pure_impl(
     pinned_base_quaternion: jnp.ndarray,      # (nenvs, 4)
     pinned_base_linear_velocity: jnp.ndarray,   # (nenvs, 3)
     pinned_base_angular_velocity: jnp.ndarray,  # (nenvs, 3)
+    pinned_joint_positions: jnp.ndarray,        # (nenvs, dofs) — only the "static" columns matter
+    static_joint_mask: jnp.ndarray,             # (dofs,) bool
     pusher_x_idx: int,
     pusher_y_idx: int,
     T_x_idx: int,
@@ -518,12 +520,17 @@ def _step_pure_impl(
         joint_forces = joint_forces.at[:, T_theta_idx].set(tau_t + tau_fric)
 
         data = step_parallel(model, data, joint_forces)
+        mask = static_joint_mask[None, :]
+        jp_pinned = jnp.where(mask, pinned_joint_positions, data.joint_positions)
+        jv_pinned = jnp.where(mask, 0.0, data.joint_velocities)
         data = data.replace(
             model=model,
             base_position=pinned_base_position,
             base_quaternion=pinned_base_quaternion,
             base_linear_velocity=pinned_base_linear_velocity,
             base_angular_velocity=pinned_base_angular_velocity,
+            joint_positions=jp_pinned,
+            joint_velocities=jv_pinned,
         )
 
         tx = data.joint_positions[:, T_x_idx]
@@ -584,6 +591,25 @@ class PushTEnv:
         self._T_target_theta_idx = joint_names.index("t_target_block_joint_theta")
         self._pusher_x_idx = joint_names.index("pusher_joint_x")
         self._pusher_y_idx = joint_names.index("pusher_joint_y")
+
+        # "Active" joints are the ones whose state is driven by our physics
+        # (pusher PD control + T block custom contact/friction).  Everything
+        # else (walls, target-T) has no physical driver and is only held in
+        # place by soft joint limits that JaxSim does not enforce rigidly —
+        # so they accumulate integrator drift over long rollouts.  We pin
+        # them back to their reset values every sim step.
+        active_joint_idxs = {
+            self._T_x_idx,
+            self._T_y_idx,
+            self._T_theta_idx,
+            self._pusher_x_idx,
+            self._pusher_y_idx,
+        }
+        dofs = self._model.dofs()
+        static_mask_np = np.array(
+            [i not in active_joint_idxs for i in range(dofs)], dtype=bool
+        )
+        self._static_joint_mask = jnp.asarray(static_mask_np)  # (dofs,)
 
         key = jax.random.PRNGKey(seed=0)
         key, *subkeys = jax.random.split(key=key, num=nenvs + 1)
@@ -771,6 +797,9 @@ class PushTEnv:
         self._pinned_base_quaternion = self._data.base_quaternion
         self._pinned_base_linear_velocity = jnp.zeros_like(self._data._base_linear_velocity)
         self._pinned_base_angular_velocity = jnp.zeros_like(self._data._base_angular_velocity)
+        # Cache pinned joint positions for the "static" joints (walls,
+        # target-T) so every sim step can clamp them back and prevent drift.
+        self._pinned_joint_positions = self._data.joint_positions
         zero_forces = jnp.zeros((self._nenvs, self._model.dofs()))
         self._data = step_parallel(self._model, self._data, zero_forces)
         self._data = self._pin_base(self._data)
@@ -785,17 +814,23 @@ class PushTEnv:
         return self._poses.copy()
 
     def _pin_base(self, data: js.data.JaxSimModelData) -> js.data.JaxSimModelData:
-        """Force env_center back to its fixed world pose with zero velocity.
-
-        This prevents the floating base from drifting due to reaction forces
-        from joint torques applied to the pusher/T-block.
+        """Force env_center back to its fixed world pose with zero velocity
+        and re-clamp the "static" joints (walls, target-T) to their reset
+        values.  Needed because JaxSim's articulated dynamics let small
+        numerical noise accumulate on joints whose soft limits are supposed
+        to hold them fixed.
         """
+        mask = self._static_joint_mask[None, :]   # (1, dofs)
+        jp = jnp.where(mask, self._pinned_joint_positions, data.joint_positions)
+        jv = jnp.where(mask, 0.0, data.joint_velocities)
         return data.replace(
             model=self._model,
             base_position=self._pinned_base_position,
             base_quaternion=self._pinned_base_quaternion,
             base_linear_velocity=self._pinned_base_linear_velocity,
             base_angular_velocity=self._pinned_base_angular_velocity,
+            joint_positions=jp,
+            joint_velocities=jv,
         )
 
     # ── Pure, differentiable step ────────────────────────────────────────
@@ -865,6 +900,8 @@ class PushTEnv:
             self._pinned_base_quaternion,
             self._pinned_base_linear_velocity,
             self._pinned_base_angular_velocity,
+            self._pinned_joint_positions,
+            self._static_joint_mask,
             self._pusher_x_idx,
             self._pusher_y_idx,
             self._T_x_idx,
