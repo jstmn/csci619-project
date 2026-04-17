@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<!--
+  Push-T environment: T-shaped block (SDF for jaxsim)
+  =====================================================
+  Top bar : 20 cm × 5 cm  (x × y),  stem: 5 cm × 20 cm (x × y)
+  Depth   : 5 cm (+z)
+
+  Link-frame origin:
+    x : centre of 20 cm top bar  (+10 cm from left edge)
+    y : +12.5 cm from bottom edge
+    z : floor level  (block occupies z ∈ [0, 0.05])
+
+  Corner positions in link frame (floor level, z = 0):
+    p0 (-0.025, -0.125)   p7 (+0.025, -0.125)
+    p1 (-0.025, +0.075)   p6 (+0.025, +0.075)
+    p2 (-0.100, +0.075)   p5 (+0.100, +0.075)
+    p3 (-0.100, +0.125)   p4 (+0.100, +0.125)
+
+  Face midpoints (outward normals, z = 0.025):
+    A (face 0): x= -0.025, y ∈ [-0.125, +0.075], normal (-1, 0, 0)
+    B (face 1): y= +0.075, x ∈ [-0.100, -0.025], normal ( 0,+1, 0)  ← inner shoulder
+    C (face 2): y= +0.125, x ∈ [-0.100, +0.100], normal ( 0,+1, 0)
+    D (face 3): x= +0.100, y ∈ [+0.075, +0.125], normal (+1, 0, 0)  ← outer right
+    E (face 4): x= +0.025, y ∈ [-0.125, +0.075], normal (+1, 0, 0)
+    F (face 5): y= -0.125, x ∈ [-0.025, +0.025], normal ( 0,-1, 0)
+
+  Inertial properties (ρ = 600 kg/m³):
+    M = 0.60 kg   COM = (0, 0.0375, 0.025)
+    Ixx = 3.531e-3   Iyy = 1.188e-3   Izz = 4.469e-3  [kg·m²]
+-->
+<sdf version="1.7">
+  <model name="t_block">
+
+    <link name="t_block">
+
+      <inertial>
+        <!-- COM in link frame -->
+        <pose>0 0.0375 0.025 0 0 0</pose>
+        <mass>0.60</mass>
+        <inertia>
+          <ixx>3.531e-3</ixx>
+          <iyy>1.188e-3</iyy>
+          <izz>4.469e-3</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <!-- Top bar: 20 cm × 5 cm × 5 cm, centre at (0, +0.10, +0.025) -->
+      <collision name="top_bar">
+        <pose>0 0.10 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.20 0.05 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="top_bar_visual">
+        <pose>0 0.10 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.20 0.05 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>0.90 0.50 0.10 1.0</ambient>
+          <diffuse>0.90 0.50 0.10 1.0</diffuse>
+        </material>
+      </visual>
+
+      <!-- Stem: 5 cm × 20 cm × 5 cm, centre at (0, −0.025, +0.025) -->
+      <collision name="stem">
+        <pose>0 -0.025 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.05 0.20 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="stem_visual">
+        <pose>0 -0.025 0.025 0 0 0</pose>
+        <geometry>
+          <box><size>0.05 0.20 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>0.90 0.50 0.10 1.0</ambient>
+          <diffuse>0.90 0.50 0.10 1.0</diffuse>
+        </material>
+      </visual>
+
+    </link>
+
+  </model>
+</sdf>

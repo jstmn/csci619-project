@@ -1,0 +1,162 @@
+<?xml version="1.0"?>
+<!--
+  Push-T environment world (SDF 1.7)
+  ===================================
+  Combines pusher (cylinder) and t_block (T-shaped box compound) into a single
+  world for use with JaxSim.
+
+  Default spawn poses
+  t_block : origin (0, 0, 0)  — link frame origin is at floor level
+  pusher  : (0.15, -0.15, 0.025) — placed near the stem face (face F),
+            z = 0.025 so the cylinder midplane sits at half-height
+
+  Ground plane at z = 0 with gravity -9.81 m/s² along -z.
+-->
+<sdf version="1.7">
+  <world name="pusht_env">
+
+    <gravity>0 0 -9.81</gravity>
+
+    <!-- Ground plane -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="ground">
+        <collision name="ground_collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>10 10</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="ground_visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>10 10</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1.0</ambient>
+            <diffuse>0.9 0.9 0.9 1.0</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- T-shaped block (inlined from t_block.sdf) -->
+    <!--
+      Top bar : 20 cm × 5 cm × 5 cm, centre at (0, +0.10, +0.025) in link frame
+      Stem    :  5 cm × 20 cm × 5 cm, centre at (0, −0.025, +0.025) in link frame
+      Inertial COM = (0, 0.0375, 0.025), M = 0.60 kg
+    -->
+    <model name="t_block">
+      <pose>0 0 0 0 0 0</pose>
+
+      <link name="t_block">
+
+        <inertial>
+          <pose>0 0.0375 0.025 0 0 0</pose>
+          <mass>0.60</mass>
+          <inertia>
+            <ixx>3.531e-3</ixx>
+            <iyy>1.188e-3</iyy>
+            <izz>4.469e-3</izz>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyz>0</iyz>
+          </inertia>
+        </inertial>
+
+        <!-- Top bar: 20 cm × 5 cm × 5 cm, centre at (0, +0.10, +0.025) -->
+        <collision name="top_bar">
+          <pose>0 0.10 0.025 0 0 0</pose>
+          <geometry>
+            <box><size>0.20 0.05 0.05</size></box>
+          </geometry>
+        </collision>
+        <visual name="top_bar_visual">
+          <pose>0 0.10 0.025 0 0 0</pose>
+          <geometry>
+            <box><size>0.20 0.05 0.05</size></box>
+          </geometry>
+          <material>
+            <ambient>0.90 0.50 0.10 1.0</ambient>
+            <diffuse>0.90 0.50 0.10 1.0</diffuse>
+          </material>
+        </visual>
+
+        <!-- Stem: 5 cm × 20 cm × 5 cm, centre at (0, −0.025, +0.025) -->
+        <collision name="stem">
+          <pose>0 -0.025 0.025 0 0 0</pose>
+          <geometry>
+            <box><size>0.05 0.20 0.05</size></box>
+          </geometry>
+        </collision>
+        <visual name="stem_visual">
+          <pose>0 -0.025 0.025 0 0 0</pose>
+          <geometry>
+            <box><size>0.05 0.20 0.05</size></box>
+          </geometry>
+          <material>
+            <ambient>0.90 0.50 0.10 1.0</ambient>
+            <diffuse>0.90 0.50 0.10 1.0</diffuse>
+          </material>
+        </visual>
+
+      </link>
+
+    </model>
+
+    <!-- Cylinder pusher (inlined from pusher.sdf) -->
+    <!--
+      Radius 1 cm, height 5 cm, mass 0.1 kg.
+      Spawn z = 0.025 so the cylinder midplane aligns with the T-block faces.
+    -->
+    <model name="pusher">
+      <pose>0.15 -0.15 0.025 0 0 0</pose>
+
+      <link name="pusher_link">
+
+        <inertial>
+          <pose>0 0 0 0 0 0</pose>
+          <mass>0.1</mass>
+          <inertia>
+            <ixx>2.333e-5</ixx>
+            <iyy>2.333e-5</iyy>
+            <izz>5.000e-6</izz>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyz>0</iyz>
+          </inertia>
+        </inertial>
+
+        <collision name="pusher_collision">
+          <pose>0 0 0 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.01</radius>
+              <length>0.05</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="pusher_visual">
+          <pose>0 0 0 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.01</radius>
+              <length>0.05</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.20 0.40 0.80 1.0</ambient>
+            <diffuse>0.20 0.40 0.80 1.0</diffuse>
+          </material>
+        </visual>
+
+      </link>
+
+    </model>
+
+  </world>
+</sdf>

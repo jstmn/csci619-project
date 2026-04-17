@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<!--
+  Push-T environment: cylinder pusher (SDF for jaxsim)
+  =====================================================
+  Geometry : cylinder, radius = 1 cm, height = 5 cm
+  Mass     : 0.1 kg
+
+  Modelled as a free-floating body so its (x, y) position can be set
+  directly each step via JaxSimModelData.base_position.  No prismatic
+  joints are needed because position is driven externally.
+
+  The block and pusher both rest with their bottom face at z = 0, so
+  the pusher base_position z should be 0.025 (cylinder half-height)
+  to align its side surface with the T-block faces.
+
+  Inertia (solid cylinder, r = 0.01 m, h = 0.05 m, m = 0.1 kg):
+    Ixx = Iyy = m/12 × (3r² + h²) = 2.333e-5 kg·m²
+    Izz       = m/2  ×  r²         = 5.000e-6 kg·m²
+-->
+<sdf version="1.7">
+  <model name="pusher">
+
+    <link name="pusher_link">
+
+      <inertial>
+        <pose>0 0 0 0 0 0</pose>
+        <mass>0.1</mass>
+        <inertia>
+          <ixx>2.333e-5</ixx>
+          <iyy>2.333e-5</iyy>
+          <izz>5.000e-6</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <collision name="pusher_collision">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="pusher_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.20 0.40 0.80 1.0</ambient>
+          <diffuse>0.20 0.40 0.80 1.0</diffuse>
+        </material>
+      </visual>
+
+    </link>
+
+  </model>
+</sdf>
