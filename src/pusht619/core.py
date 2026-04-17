@@ -106,7 +106,7 @@ class ActionResult:
 
     @property
     def n_timesteps(self) -> int:
-        return len(self.t_poses)
+        return self.t_poses.shape[1]
 
     def __post_init__(self):
         assert isinstance(self.action, Action), "action must be an Action"
@@ -185,12 +185,14 @@ class PushTEnv:
             jnp.linspace(-row_dist, row_dist, num=row_length),
         )
         xy_coordinate = jnp.stack([x.flatten(), y.flatten()], axis=-1)
+        self._xy_centers = np.array(xy_coordinate)
         self._data = data_batch_t0.replace(
             model=self._model,
             base_position=data_batch_t0.base_position.at[:, :2].set(xy_coordinate),
         )
-        step_parallel(self._model, self._data)
-
+        
+        self.reset()
+        
         if record_video:
             mjcf_string, assets = jaxsim.mujoco.ModelToMjcf.convert(
                 self._model.built_from,
@@ -228,6 +230,29 @@ class PushTEnv:
         self._poses = np.zeros((self._nenvs, 3), dtype=np.float64)
         self._poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
         self._frames = []
+        
+        # Compute quaternions for rotation around Z
+        half_theta = self._poses[:, 2] / 2.0
+        qw = np.cos(half_theta)
+        qz = np.sin(half_theta)
+        qx = np.zeros_like(qw)
+        qy = np.zeros_like(qw)
+        quats = np.stack([qw, qx, qy, qz], axis=-1)
+        
+        # Compute new base position with XY from centers and Z=0.0
+        new_base_position = self._data.base_position.at[:, :2].set(self._xy_centers + self._poses[:, :2])
+        new_base_position = new_base_position.at[:, 2].set(0.0)
+
+        # Reset internal JaxSim data
+        self._data = self._data.replace(
+            model=self._model,
+            base_position=new_base_position,
+            base_quaternion=jnp.array(quats),
+            base_linear_velocity=jnp.zeros_like(self._data._base_linear_velocity),
+            base_angular_velocity=jnp.zeros_like(self._data._base_angular_velocity),
+        )
+        self._data = step_parallel(self._model, self._data)
+        
         return self._poses.copy()
 
     def step(self, action: Action, n_sim_steps: int = 10) -> ActionResult:
@@ -246,8 +271,8 @@ class PushTEnv:
         for _ in range(n_sim_steps):
             self._data = step_parallel(self._model, self._data)
             
-            x = self._data.base_position[:, 0]
-            y = self._data.base_position[:, 1]
+            x = self._data.base_position[:, 0] - self._xy_centers[:, 0]
+            y = self._data.base_position[:, 1] - self._xy_centers[:, 1]
             qw = self._data.base_orientation[:, 0]
             qz = self._data.base_orientation[:, 3]
             theta = 2.0 * jnp.arctan2(qz, qw)

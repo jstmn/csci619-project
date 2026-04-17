@@ -16,10 +16,11 @@ def test_PushTEnv_smoke_test() -> None:
         angle=np.array([np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2]).reshape(9, 1),
         push_distance=np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]).reshape(9, 1),
     )
-    result = env.step(action)
+    n_sim_steps = 100
+    result = env.step(action, n_sim_steps=n_sim_steps)
     assert result.action == action
-    assert result.t_poses.shape == (9, 10, 3)
-    assert result.t_distances.shape == (9, 10)
+    assert result.t_poses.shape == (9, n_sim_steps, 3)
+    assert result.t_distances.shape == (9, n_sim_steps)
 
 
     # Next, save a video
