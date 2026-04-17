@@ -6,14 +6,15 @@ import pytest
 from pusht619.core import Action, PushTEnv
 
 
-
 # python -m pytest tests/test_core.py::test_PushTEnv_smoke_test --capture=no
 def test_PushTEnv_smoke_test() -> None:
     env = PushTEnv(nenvs=9, record_video=True, visualize=False)
     action = Action(
         face=np.array([0, 1, 2, 3, 4, 5, 0, 1, 2]).reshape(9, 1),
         contact_point=np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]).reshape(9, 1),
-        angle=np.array([np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2]).reshape(9, 1),
+        angle=np.array(
+            [np.pi / 2, np.pi / 2, np.pi / 2, np.pi / 2, np.pi / 2, np.pi / 2, np.pi / 2, np.pi / 2, np.pi / 2]
+        ).reshape(9, 1),
         # push_distance=np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]).reshape(9, 1),
     )
     n_sim_steps = 100
@@ -21,7 +22,6 @@ def test_PushTEnv_smoke_test() -> None:
     assert result.action == action
     assert result.t_poses.shape == (9, n_sim_steps, 3)
     assert result.t_distances.shape == (9, n_sim_steps)
-
 
     # Next, save a video
     save_filepath = Path("/tmp/test_PushTEnv_smoke_test.mp4")
@@ -50,9 +50,7 @@ def test_step_executes_push_action() -> None:
     env.step(action, n_sim_steps=100)
 
     final_t_pose = env.poses.copy()
-    final_pusher_xy = np.asarray(
-        env._data.joint_positions[0, [env._pusher_x_idx, env._pusher_y_idx]]
-    )
+    final_pusher_xy = np.asarray(env._data.joint_positions[0, [env._pusher_x_idx, env._pusher_y_idx]])
 
     assert np.linalg.norm(final_t_pose - initial_t_pose) > 1e-4
     assert np.linalg.norm(final_pusher_xy - np.array([0.75, 0.75])) > 0.1

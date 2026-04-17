@@ -31,21 +31,22 @@ WORKSPACE_WIDTH = 1.5
 WORKSPACE_HEIGHT = 1.5
 PUSHER_RADIUS = 0.01
 PUSHER_CLEARANCE = 0.005
+PUSHER_APPROACH_DISTANCE = 0.04
 DEFAULT_PUSH_DISTANCE = 0.10
-PUSHER_KP = 400.0
-PUSHER_KD = 40.0
-PUSHER_MAX_FORCE = 50.0
+PUSHER_KP = 250.0
+PUSHER_KD = 30.0
+PUSHER_MAX_FORCE = 20.0
 
 T_CORNERS = np.array(
     [
         [-0.025, -0.125],  # p0
-        [-0.025, 0.075],   # p1
-        [-0.10, 0.075],    # p2
-        [-0.10, 0.125],    # p3
-        [0.10, 0.125],     # p4
-        [0.10, 0.075],     # p5
-        [0.025, 0.075],    # p6
-        [0.025, -0.125],   # p7
+        [-0.025, 0.075],  # p1
+        [-0.10, 0.075],  # p2
+        [-0.10, 0.125],  # p3
+        [0.10, 0.125],  # p4
+        [0.10, 0.075],  # p5
+        [0.025, 0.075],  # p6
+        [0.025, -0.125],  # p7
     ],
     dtype=np.float64,
 )
@@ -55,31 +56,33 @@ FACE_END_POINTS = T_CORNERS[[1, 3, 4, 5, 7, 0]]
 
 # ── Action dataclass ──────────────────────────────────────────────────────────
 
+
 @dataclass
 class Action:
     """
-    Batched push action for nenvs parallel environments.
+      Batched push action for nenvs parallel environments.
 
-    Faces
-    - A: 0, B: 1, C: 2, D: 3, E: 4, F: 5
+      Faces
+      - A: 0, B: 1, C: 2, D: 3, E: 4, F: 5
 
-     _____ C ______
-  B |              | D
-    |___       ____|
-        |     |
-        |     |
-      A |     | E
-        |_ F _|
+       _____ C ______
+    B |              | D
+      |___       ____|
+          |     |
+          |     |
+        A |     | E
+          |_ F _|
 
-    Fields (all shape (nenvs, 1)):
-      face           int32  in {0, 1, 2, 3, 4, 5}
-      contact_point  float32 in [0, 1]   (0 = start corner, 1 = end corner)
-      angle          float32 in [0, π]   (0 = tangent, π/2 = into block)
-      push_distance  float32 in [0, 0.1] (metres)
+      Fields (all shape (nenvs, 1)):
+        face           int32  in {0, 1, 2, 3, 4, 5}
+        contact_point  float32 in [0, 1]   (0 = start corner, 1 = end corner)
+        angle          float32 in [0, π]   (0 = tangent, π/2 = into block)
+        push_distance  float32 in [0, 0.1] (metres)
     """
-    face:           np.ndarray
-    contact_point:  np.ndarray
-    angle:          np.ndarray
+
+    face: np.ndarray
+    contact_point: np.ndarray
+    angle: np.ndarray
     # push_distance:  np.ndarray
 
     @property
@@ -88,20 +91,19 @@ class Action:
 
     def __post_init__(self):
         for name, arr in (
-            ("face",          self.face),
+            ("face", self.face),
             ("contact_point", self.contact_point),
-            ("angle",         self.angle),
+            ("angle", self.angle),
             # ("push_distance", self.push_distance),
         ):
             assert isinstance(arr, np.ndarray), f"{name} must be np.ndarray"
             assert arr.shape == (self.nenvs, 1), f"{name} must be (nenvs, 1), got shape {arr.shape}"
 
-        assert self.face.dtype in [np.int32, np.int64], \
-            f"face must be int32 or int64, got {self.face.dtype}"
-        assert self.contact_point.dtype in [np.float32, np.float64], \
+        assert self.face.dtype in [np.int32, np.int64], f"face must be int32 or int64, got {self.face.dtype}"
+        assert self.contact_point.dtype in [np.float32, np.float64], (
             f"contact_point must be float32 or float64, got {self.contact_point.dtype}"
-        assert self.angle.dtype in [np.float32, np.float64], \
-            f"angle must be float32 or float64, got {self.angle.dtype}"
+        )
+        assert self.angle.dtype in [np.float32, np.float64], f"angle must be float32 or float64, got {self.angle.dtype}"
         # assert self.push_distance.dtype in [np.float32, np.float64], \
         #     f"push_distance must be float32 or float64, got {self.push_distance.dtype}"
 
@@ -110,12 +112,9 @@ class Action:
         assert len(self.angle) == n
         # assert len(self.push_distance) == n
 
-        assert np.all((self.face >= 0) & (self.face <= 5)), \
-            "face must be in {0, …, 5}"
-        assert np.all((self.contact_point >= 0) & (self.contact_point <= 1)), \
-            "contact_point must be in [0, 1]"
-        assert np.all((self.angle >= 0) & (self.angle <= np.pi)), \
-            "angle must be in [0, π]"
+        assert np.all((self.face >= 0) & (self.face <= 5)), "face must be in {0, …, 5}"
+        assert np.all((self.contact_point >= 0) & (self.contact_point <= 1)), "contact_point must be in [0, 1]"
+        assert np.all((self.angle >= 0) & (self.angle <= np.pi)), "angle must be in [0, π]"
         # assert np.all((self.push_distance >= 0) & (self.push_distance <= 0.1)), \
         #     "push_distance must be in [0, 0.1]"
 
@@ -125,10 +124,10 @@ class ActionResult:
     """
     Result of applying an action to an environment.
     """
+
     action: Action
     t_poses: np.ndarray
     t_distances: np.ndarray
-
 
     @property
     def n_timesteps(self) -> int:
@@ -136,10 +135,12 @@ class ActionResult:
 
     def __post_init__(self):
         assert isinstance(self.action, Action), "action must be an Action"
-        assert self.t_poses.shape == (self.action.nenvs, self.n_timesteps, 3), \
+        assert self.t_poses.shape == (self.action.nenvs, self.n_timesteps, 3), (
             f"t_poses must be (nenvs, n_timesteps, 3), got shape {self.t_poses.shape}"
-        assert self.t_distances.shape == (self.action.nenvs, self.n_timesteps), \
+        )
+        assert self.t_distances.shape == (self.action.nenvs, self.n_timesteps), (
             f"t_distances must be (nenvs, n_timesteps), got shape {self.t_distances.shape}"
+        )
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -173,7 +174,6 @@ def step_parallel(
     )
 
 
-
 class PushTEnv:
     """
     Parallel Push-T environment.
@@ -193,9 +193,7 @@ class PushTEnv:
 
         rod_sdf = rod.Sdf.load(pathlib.Path("assets/scene.sdf"))
         for model in rod_sdf.models():
-            model.switch_frame_convention(
-                frame_convention=rod.FrameConvention.Urdf, explicit_frames=True
-            )
+            model.switch_frame_convention(frame_convention=rod.FrameConvention.Urdf, explicit_frames=True)
         model_sdf_string = rod_sdf.serialize(pretty=True)
 
         self._model = js.model.JaxSimModel.build_from_model_description(
@@ -238,7 +236,7 @@ class PushTEnv:
             model=self._model,
             base_position=data_batch_t0.base_position.at[:, :2].set(xy_coordinate),
         )
-        
+
         self.reset()
 
         if self._visualize:
@@ -267,12 +265,14 @@ class PushTEnv:
             self._mj_multi_model = mj.MjModel.from_xml_string(multi_xml, assets=assets)
             self._mj_multi_model.opt.gravity[:] = 0.0  # Prevent bodies drifting in MuJoCo physics step
             self._mj_multi_data = mj.MjData(self._mj_multi_model)
-            self._visualizer = jaxsim.mujoco.MujocoVisualizer(
-                model=self._mj_multi_model, data=self._mj_multi_data
-            )
+            self._visualizer = jaxsim.mujoco.MujocoVisualizer(model=self._mj_multi_model, data=self._mj_multi_data)
             self._viewer = self._visualizer.open_viewer()
             jaxsim.mujoco.MujocoVisualizer.setup_viewer_camera(
-                self._viewer, lookat=[WORKSPACE_WIDTH/2, WORKSPACE_HEIGHT/2, 0.1], distance=3.0, azimuth=150, elevation=-30
+                self._viewer,
+                lookat=[WORKSPACE_WIDTH / 2, WORKSPACE_HEIGHT / 2, 0.1],
+                distance=3.0,
+                azimuth=150,
+                elevation=-30,
             )
             self._sync_visualizer()
         else:
@@ -292,7 +292,8 @@ class PushTEnv:
             )
 
             self._mj_model_helpers = [
-                jaxsim.mujoco.MujocoModelHelper.build_from_xml(mjcf_description=mjcf_string, assets=assets) for _ in range(nenvs)
+                jaxsim.mujoco.MujocoModelHelper.build_from_xml(mjcf_description=mjcf_string, assets=assets)
+                for _ in range(nenvs)
             ]
             self._recorder = jaxsim.mujoco.MujocoVideoRecorder(
                 model=self._mj_model_helpers[0].model,
@@ -301,7 +302,6 @@ class PushTEnv:
                 width=320 * 2,
                 height=240 * 2,
             )
-
 
     @property
     def nenvs(self) -> int:
@@ -316,25 +316,19 @@ class PushTEnv:
             ]
         )
 
-    def _plan_push(self, action: Action) -> tuple[np.ndarray, np.ndarray]:
+    def _plan_push(self, action: Action) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         poses = self._current_t_poses()
         face = action.face[:, 0]
         contact_point = action.contact_point[:, 0]
         angle = action.angle[:, 0]
-
         face_starts = FACE_START_POINTS[face]
         face_ends = FACE_END_POINTS[face]
         face_vectors = face_ends - face_starts
         face_lengths = np.linalg.norm(face_vectors, axis=1, keepdims=True)
         face_tangents = face_vectors / face_lengths
         face_inward_normals = np.column_stack([face_tangents[:, 1], -face_tangents[:, 0]])
-
         contact_body = face_starts + contact_point[:, None] * face_vectors
-        push_direction_body = (
-            np.cos(angle)[:, None] * face_tangents
-            + np.sin(angle)[:, None] * face_inward_normals
-        )
-
+        push_direction_body = np.cos(angle)[:, None] * face_tangents + np.sin(angle)[:, None] * face_inward_normals
         cos_theta = np.cos(poses[:, 2])
         sin_theta = np.sin(poses[:, 2])
         rotation_matrices = np.stack(
@@ -344,29 +338,27 @@ class PushTEnv:
             ],
             axis=1,
         )
-
         contact_world = poses[:, :2] + np.einsum("nij,nj->ni", rotation_matrices, contact_body)
-        inward_world = np.einsum("nij,nj->ni", rotation_matrices, face_inward_normals)
-        push_direction_world = np.einsum(
-            "nij,nj->ni", rotation_matrices, push_direction_body
-        )
-        push_direction_world /= np.linalg.norm(
-            push_direction_world, axis=1, keepdims=True
-        )
-
-        pusher_start = contact_world - (PUSHER_RADIUS + PUSHER_CLEARANCE) * inward_world
+        push_direction_world = np.einsum("nij,nj->ni", rotation_matrices, push_direction_body)
+        push_direction_world /= np.linalg.norm(push_direction_world, axis=1, keepdims=True)
+        pre_contact = contact_world - (PUSHER_RADIUS + PUSHER_CLEARANCE) * push_direction_world
+        pusher_start = pre_contact - PUSHER_APPROACH_DISTANCE * push_direction_world
         workspace_margin = PUSHER_RADIUS
         pusher_start = np.clip(
             pusher_start,
             workspace_margin,
             np.array([WORKSPACE_WIDTH, WORKSPACE_HEIGHT]) - workspace_margin,
         )
-        return pusher_start, push_direction_world
+        pre_contact = np.clip(
+            pre_contact,
+            workspace_margin,
+            np.array([WORKSPACE_WIDTH, WORKSPACE_HEIGHT]) - workspace_margin,
+        )
+        return pusher_start, pre_contact, push_direction_world
 
     def _sync_visualizer(self) -> None:
         if self._visualizer is None:
             return
-            
         for i in range(self._nenvs):
             # Update free joint for env_center_i
             jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, f"world_to_base_{i}")
@@ -374,7 +366,7 @@ class PushTEnv:
                 qpos_adr = self._mj_multi_model.jnt_qposadr[jnt_id]
                 self._mj_multi_data.qpos[qpos_adr : qpos_adr + 3] = self._data.base_position[i]
                 self._mj_multi_data.qpos[qpos_adr + 3 : qpos_adr + 7] = self._data.base_orientation[i]
-            
+
             # Update 1D joints
             for jnt_name in self._model.joint_names():
                 multi_jnt_name = f"{jnt_name}_{i}"
@@ -383,7 +375,7 @@ class PushTEnv:
                     qpos_adr = self._mj_multi_model.jnt_qposadr[multi_jnt_id]
                     orig_jnt_idx = self._model.joint_names().index(jnt_name)
                     self._mj_multi_data.qpos[qpos_adr] = self._data.joint_positions[i, orig_jnt_idx]
-                    
+
         self._visualizer.sync(self._viewer)
 
     def reset(self, seed: int = 0) -> np.ndarray:
@@ -398,7 +390,7 @@ class PushTEnv:
         self._target_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
         self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
         self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
-        # 
+        #
         self._poses = np.zeros((self._nenvs, 3), dtype=np.float64)
         self._poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
         self._poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
@@ -406,15 +398,15 @@ class PushTEnv:
 
         # Reset video frames
         self._frames = []
-        
+
         # The base is env_center at xy_centers, with identity orientation
         new_base_position = self._data.base_position.at[:, :2].set(self._xy_centers)
         new_base_position = new_base_position.at[:, 2].set(0.01)
-        
+
         # Identity quaternions for env_center
         quats = jnp.zeros_like(self._data.base_orientation)
         quats = quats.at[:, 0].set(1.0)
-        
+
         # Update joint positions for t_block and pusher
         new_joint_positions = jnp.zeros_like(self._data.joint_positions)
         new_joint_positions = new_joint_positions.at[:, self._T_x_idx].set(self._poses[:, 0])
@@ -440,7 +432,6 @@ class PushTEnv:
         self._data = step_parallel(self._model, self._data, zero_forces)
         self._poses = self._current_t_poses()
         self._sync_visualizer()
-        
         return self._poses.copy()
 
     def step(self, action: Action, n_sim_steps: int = 10) -> ActionResult:
@@ -452,17 +443,35 @@ class PushTEnv:
         # TODO: removed n_sim_steps and use push_distance
         assert isinstance(action, Action), "action must be an Action"
         assert action.nenvs == self._nenvs, f"action.nenvs != self._nenvs ({action.nenvs} != {self._nenvs})"
+        assert n_sim_steps > 0, "n_sim_steps must be greater than 0"
 
-        pusher_start, push_direction = self._plan_push(action)
+        pusher_start, pre_contact, push_direction = self._plan_push(action)
         initial_joint_positions = self._data.joint_positions
         initial_joint_velocities = self._data.joint_velocities
         joint_positions = initial_joint_positions.at[:, self._pusher_x_idx].set(pusher_start[:, 0])
         joint_positions = joint_positions.at[:, self._pusher_y_idx].set(pusher_start[:, 1])
         joint_velocities = initial_joint_velocities.at[:, self._pusher_x_idx].set(0.0)
         joint_velocities = joint_velocities.at[:, self._pusher_y_idx].set(0.0)
-        self._data = self._data.replace(model=self._model, joint_positions=joint_positions, joint_velocities=joint_velocities)
-        push_targets = np.linspace(0.0, DEFAULT_PUSH_DISTANCE, num=n_sim_steps, endpoint=True,dtype=np.float64)
-        pusher_targets = pusher_start[:, None, :] + push_targets[None, :, None] * push_direction[:, None, :]
+        self._data = self._data.replace(
+            model=self._model, joint_positions=joint_positions, joint_velocities=joint_velocities
+        )
+
+        approach_steps = max(1, n_sim_steps // 4)
+        push_steps = max(1, n_sim_steps - approach_steps)
+        approach_scales = np.linspace(0.0, 1.0, num=approach_steps, endpoint=True, dtype=np.float64)
+        push_scales = np.linspace(
+            0.0,
+            DEFAULT_PUSH_DISTANCE,
+            num=push_steps,
+            endpoint=True,
+            dtype=np.float64,
+        )
+        approach_targets = (
+            pusher_start[:, None, :] + approach_scales[None, :, None] * (pre_contact - pusher_start)[:, None, :]
+        )
+        push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
+        pusher_targets = np.concatenate([approach_targets, push_targets], axis=1)
+        pusher_targets = pusher_targets[:, :n_sim_steps, :]
         workspace_margin = PUSHER_RADIUS
         pusher_targets = np.clip(
             pusher_targets,
@@ -494,9 +503,8 @@ class PushTEnv:
                 axis=-1,
             )
 
-            pusher_forces = (
-                PUSHER_KP * (target_xy - current_xy)
-                + PUSHER_KD * (target_velocity_xy - current_velocity_xy)
+            pusher_forces = PUSHER_KP * (target_xy - current_xy) + PUSHER_KD * (
+                target_velocity_xy - current_velocity_xy
             )
             pusher_forces = jnp.clip(pusher_forces, -PUSHER_MAX_FORCE, PUSHER_MAX_FORCE)
             joint_forces = jnp.zeros((self._nenvs, self._model.dofs()))
@@ -523,15 +531,13 @@ class PushTEnv:
                 ):
                     helper.set_base_position(position=pos)
                     helper.set_base_orientation(orientation=quat)
-                    if self._model.dofs() > 0:
-                        helper.set_joint_positions(
-                            positions=jpos, joint_names=self._model.joint_names()
-                        )
+                    helper.set_joint_positions(positions=jpos, joint_names=self._model.joint_names())
                 self._recorder.record_frame(camera_name="t_block_cam")
 
             if self._visualizer is not None:
                 self._sync_visualizer()
                 import time
+
                 time.sleep(self._model.time_step)
 
         t_poses = jnp.stack(t_poses_list, axis=1)
@@ -555,7 +561,7 @@ class PushTEnv:
     def save_video(self, filename: str, delete_cache_after_saving: bool = True) -> None:
         assert self._record_video, "record_video must be True to save video"
         assert len(self._recorder.frames) > 0, "No frames to save"
-        
+
         imageio.mimwrite(filename, self._recorder.frames, fps=self._recorder.fps)
         if delete_cache_after_saving:
             self._recorder.frames.clear()

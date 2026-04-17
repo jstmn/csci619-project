@@ -14,6 +14,7 @@
 -->
 <sdf version="1.7">
   <model name="pusht_env">
+    <self_collide>true</self_collide>
 
     <!-- Canonical root link for the environment (floating base) -->
     <link name="env_center">

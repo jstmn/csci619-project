@@ -4,7 +4,6 @@ python scripts/jaxsim_reference.py
 Note that this script is derived from https://github.com/gbionics/jaxsim/blob/main/examples/jaxsim_as_physics_engine_advanced.ipynb
 """
 
-
 import functools
 import os
 import time
@@ -37,9 +36,7 @@ rod_sdf = rod.Sdf(
     .add_collision()
     .build(),
 )
-rod_sdf.model.switch_frame_convention(
-    frame_convention=rod.FrameConvention.Urdf, explicit_frames=True
-)
+rod_sdf.model.switch_frame_convention(frame_convention=rod.FrameConvention.Urdf, explicit_frames=True)
 model_sdf_string = rod_sdf.serialize(pretty=True)
 
 os.environ["JAXSIM_COLLISION_SPHERE_POINTS"] = "50"
@@ -85,6 +82,7 @@ print("W_p_B(t0)=\n", data_batch_t0.base_position[0:10])
 
 # ── Define step functions ──────────────────────────────────────────────────────
 
+
 @jax.jit
 def step_single(
     model: js.model.JaxSimModel,
@@ -125,9 +123,7 @@ mjcf_string, assets = jaxsim.mujoco.ModelToMjcf.convert(
 )
 
 mj_model_helpers = [
-    jaxsim.mujoco.MujocoModelHelper.build_from_xml(
-        mjcf_description=mjcf_string, assets=assets
-    )
+    jaxsim.mujoco.MujocoModelHelper.build_from_xml(mjcf_description=mjcf_string, assets=assets)
     for _ in range(batch_size)
 ]
 
@@ -142,9 +138,15 @@ recorder = jaxsim.mujoco.MujocoVideoRecorder(
 # Build a combined MuJoCo model with all batch_size spheres for the passive viewer.
 # Each free body contributes 7 entries to qpos: [x, y, z, qw, qx, qy, qz].
 _colors = [
-    "0.8 0.3 0.3 1", "0.3 0.8 0.3 1", "0.3 0.3 0.8 1",
-    "0.8 0.8 0.3 1", "0.8 0.3 0.8 1", "0.3 0.8 0.8 1",
-    "0.9 0.5 0.2 1", "0.5 0.2 0.9 1", "0.2 0.9 0.5 1",
+    "0.8 0.3 0.3 1",
+    "0.3 0.8 0.3 1",
+    "0.3 0.3 0.8 1",
+    "0.8 0.8 0.3 1",
+    "0.8 0.3 0.8 1",
+    "0.3 0.8 0.8 1",
+    "0.9 0.5 0.2 1",
+    "0.5 0.2 0.9 1",
+    "0.2 0.9 0.5 1",
 ]
 _root = etree.Element("mujoco", model="multi_sphere")
 etree.SubElement(_root, "option", gravity="0 0 -9.81")
@@ -192,9 +194,7 @@ with visualizer.open(
             helper.set_base_position(position=pos)
             helper.set_base_orientation(orientation=quat)
             if model.dofs() > 0:
-                helper.set_joint_positions(
-                    positions=jpos, joint_names=model.joint_names()
-                )
+                helper.set_joint_positions(positions=jpos, joint_names=model.joint_names())
         recorder.record_frame(camera_name="sphere_cam")
 
         # Update combined model and sync passive viewer.
