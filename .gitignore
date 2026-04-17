@@ -86,3 +86,5 @@ data/
 checkpoints/
 wandb/
 *.log
+*.png
+*.mp4

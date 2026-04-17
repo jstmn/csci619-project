@@ -13,6 +13,13 @@ authors = [{ name = "CSCI 619" }]
 dependencies = [
     "numpy",
     "jaxsim",
+    "matplotlib",
+    "python-dateutil",
+    "rod",
+    "mujoco",
+    "lxml",
+    "mediapy",
+    "imageio[ffmpeg]",
 ]
 
 [project.optional-dependencies]

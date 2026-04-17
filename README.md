@@ -24,6 +24,13 @@ Create and activate the conda environment, then install the package in editable 
 ```bash
 conda create -n pusht619 python=3.10
 conda activate pusht619
-conda install jaxsim -c conda-forge
 pip install -e ".[dev]"
+```
+
+
+## Running the project
+
+```bash
+# Run with claude code:
+! source ~/miniconda3/etc/profile.d/conda.sh && conda activate pusht619 && python scripts/jaxsim_reference.py
 ```
