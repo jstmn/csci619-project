@@ -1,21 +1,53 @@
 # CSCI 619 - Class Project
 
-## Project Layout
+**T block:**
+```
+# Dimensions:
 
+<-     20cm    ->
+_________________
+|                |   ^ 5 cm   ^ 25cm
+|____       _____|   |        |
+     |     |    ^             |
+     |     |    | 15 cm       |
+     |     |    |             |
+     |_____|    |             |
+     < 5cm >
+
++z height is 5cm
+
+
+# Links
+# - all p_i are on the xy plane (i.e. floor level)
+
+p4 _____________ p5
+|                 |
+p3 _ p2     p7 _ p6
+     |     |
+     |     |
+     |     |
+     p1___ p8
+
+
+# Reference frame:
+# - centered at the midway point of the T 
+# - origin-x is +10cm from the left edge
+# - origin-y is +12.5cm from the bottom edge
+# - origin-z is on the floor level
+
+_________________
+|                |
+|____       _____|
+    |      |
+       +y
+       ^
+       |--> +x
+
+    |_____|
 ```
-csci619_class_project/
-├── pyproject.toml        # Build + tool configuration
-├── README.md
-├── LICENSE
-├── .gitignore
-├── src/
-│   └── pusht619/         # Main package
-│       ├── __init__.py
-│       └── __main__.py
-└── tests/                # Pytest suite
-    ├── __init__.py
-    └── test_smoke.py
-```
+
+Note that urdfs can be easily visualized using the [URDF Visualizer](https://marketplace.cursorapi.com/items/?itemName=morningfrog.urdf-visualizer) VSCode extension.
+
 
 ## Installation
 

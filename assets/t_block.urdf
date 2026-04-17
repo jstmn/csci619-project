@@ -2,80 +2,162 @@
 <!--
   Push-T environment: T-shaped block
   ===================================
-  Large sides : 10 cm  (top-bar length, stem height)
-  Small sides :  5 cm  (bar/stem width and block thickness)
+  Top bar : 20 cm × 5 cm  (x-width × y-height)
+  Stem    :  5 cm × 20 cm (x-width × y-height)
+  +z depth: 5 cm
+  Total height: 25 cm
 
-  T shape (top view, z is up):
-    ┌──────────────────────┐  ← top bar  10 cm × 5 cm  (x × y)
-    └─────────┬────────────┘
-              │              stem  5 cm × 5 cm  (x × y)
-              └─────
+  Reference frame:
+    origin-x : +10 cm from left edge  (= x-center of 20 cm bar)
+    origin-y : +12.5 cm from bottom   (= y-center of 25 cm total height)
+    origin-z : floor level (z = 0)    (block occupies z ∈ [0, 0.05])
 
-  Link frame  : center of bounding box  (10 cm × 10 cm × 5 cm)
-                top bar  → y = +2.5 cm from origin
-                stem     → y = −2.5 cm from origin
-                z range  → [−2.5 cm, +2.5 cm]
+  T shape (top view, corners labelled):
 
-  To rest on ground plane (z = 0): spawn with z = 0.025 m.
+    p4 _____________ p5        y = +0.125
+    |                 |
+    p3 _ p2     p7 _ p6        y = +0.075
+         |     |
+         |     |
+         |     |
+         p1___ p8              y = −0.125
 
-  Inertia: uniform density ρ = 600 kg/m³ (wood-like)
-    m_bar  = 0.15  kg  (0.10 × 0.05 × 0.05 × 600)
-    m_stem = 0.075 kg  (0.05 × 0.05 × 0.05 × 600)
-    M      = 0.225 kg
-    COM_y  = (0.15 × 0.025 − 0.075 × 0.025) / 0.225  =  0.008333 m
+    x:  −0.10  −0.025  +0.025  +0.10
+    (all p_i at z = 0, i.e. floor level)
 
-  Composite inertia about COM (parallel-axis theorem):
-    Ixx = 2.1875e-4  kg·m²
-    Iyy = 1.8750e-4  kg·m²
-    Izz = 3.1250e-4  kg·m²
+  Geometry in link frame (box centers):
+    top bar center : (0,  +0.10,  +0.025)   size 0.20 × 0.05 × 0.05
+    stem center    : (0,  −0.025, +0.025)   size 0.05 × 0.20 × 0.05
+
+  Inertial properties (ρ = 600 kg/m³, wood-like):
+    m_bar  = 0.20 × 0.05 × 0.05 × 600 = 0.30 kg
+    m_stem = 0.05 × 0.20 × 0.05 × 600 = 0.30 kg
+    M      = 0.60 kg
+
+    COM_y  = (0.30 × 0.10 + 0.30 × (−0.025)) / 0.60 = 0.0375 m
+    COM_z  = 0.025 m  (mid-depth, both pieces share same z-center)
+    COM    = (0, 0.0375, 0.025)
+
+    d_bar  = 0.10  − 0.0375 =  0.0625 m  (in y only)
+    d_stem = −0.025 − 0.0375 = −0.0625 m (in y only)
+
+    Ixx = (1/12·0.30·(0.05²+0.05²) + 0.30·0.0625²)
+        + (1/12·0.30·(0.20²+0.05²) + 0.30·0.0625²)
+        = 1.297e-3 + 2.234e-3 = 3.531e-3  kg·m²
+
+    Iyy = 1/12·0.30·(0.20²+0.05²) + 1/12·0.30·(0.05²+0.05²)
+        = 1.0625e-3 + 1.25e-4 = 1.188e-3  kg·m²
+
+    Izz = (1/12·0.30·(0.20²+0.05²) + 0.30·0.0625²)
+        + (1/12·0.30·(0.05²+0.20²) + 0.30·0.0625²)
+        = 2.234e-3 + 2.234e-3 = 4.469e-3  kg·m²
+
+  To rest on ground plane (z = 0): spawn with z = 0 (origin already at floor).
 -->
 <robot name="t_block">
 
   <link name="t_block">
 
-    <!-- Inertial: origin is the center of mass, not the link frame -->
     <inertial>
-      <origin xyz="0 0.008333 0" rpy="0 0 0"/>
-      <mass value="0.225"/>
+      <origin xyz="0 0.0375 0.025" rpy="0 0 0"/>
+      <mass value="0.60"/>
       <inertia
-        ixx="2.1875e-4"  iyy="1.8750e-4"  izz="3.1250e-4"
+        ixx="3.531e-3"  iyy="1.188e-3"  izz="4.469e-3"
         ixy="0"          ixz="0"           iyz="0"/>
     </inertial>
 
-    <!-- Top bar: 10 cm (x) × 5 cm (y) × 5 cm (z) -->
+    <!-- Top bar: 20 cm (x) × 5 cm (y) × 5 cm (z), center at (0, +0.10, +0.025) -->
     <visual>
-      <origin xyz="0 0.025 0" rpy="0 0 0"/>
+      <origin xyz="0 0.10 0.025" rpy="0 0 0"/>
       <geometry>
-        <box size="0.10 0.05 0.05"/>
+        <box size="0.20 0.05 0.05"/>
       </geometry>
       <material name="orange">
         <color rgba="0.90 0.50 0.10 1.0"/>
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0.025 0" rpy="0 0 0"/>
+      <origin xyz="0 0.10 0.025" rpy="0 0 0"/>
       <geometry>
-        <box size="0.10 0.05 0.05"/>
+        <box size="0.20 0.05 0.05"/>
       </geometry>
     </collision>
 
-    <!-- Vertical stem: 5 cm (x) × 5 cm (y) × 5 cm (z) -->
+    <!-- Stem: 5 cm (x) × 20 cm (y) × 5 cm (z), center at (0, −0.025, +0.025) -->
     <visual>
-      <origin xyz="0 -0.025 0" rpy="0 0 0"/>
+      <origin xyz="0 -0.025 0.025" rpy="0 0 0"/>
       <geometry>
-        <box size="0.05 0.05 0.05"/>
+        <box size="0.05 0.20 0.05"/>
       </geometry>
       <material name="orange">
         <color rgba="0.90 0.50 0.10 1.0"/>
       </material>
     </visual>
     <collision>
-      <origin xyz="0 -0.025 0" rpy="0 0 0"/>
+      <origin xyz="0 -0.025 0.025" rpy="0 0 0"/>
       <geometry>
-        <box size="0.05 0.05 0.05"/>
+        <box size="0.05 0.20 0.05"/>
       </geometry>
     </collision>
 
   </link>
+
+  <!-- Corner frames (floor level, z = 0) -->
+
+  <link name="p1"/>
+  <joint name="t_block_p1" type="fixed">
+    <parent link="t_block"/>
+    <child link="p1"/>
+    <origin xyz="-0.025 -0.125 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="p2"/>
+  <joint name="t_block_p2" type="fixed">
+    <parent link="t_block"/>
+    <child link="p2"/>
+    <origin xyz="-0.025 0.075 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="p3"/>
+  <joint name="t_block_p3" type="fixed">
+    <parent link="t_block"/>
+    <child link="p3"/>
+    <origin xyz="-0.10 0.075 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="p4"/>
+  <joint name="t_block_p4" type="fixed">
+    <parent link="t_block"/>
+    <child link="p4"/>
+    <origin xyz="-0.10 0.125 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="p5"/>
+  <joint name="t_block_p5" type="fixed">
+    <parent link="t_block"/>
+    <child link="p5"/>
+    <origin xyz="0.10 0.125 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="p6"/>
+  <joint name="t_block_p6" type="fixed">
+    <parent link="t_block"/>
+    <child link="p6"/>
+    <origin xyz="0.10 0.075 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="p7"/>
+  <joint name="t_block_p7" type="fixed">
+    <parent link="t_block"/>
+    <child link="p7"/>
+    <origin xyz="0.025 0.075 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="p8"/>
+  <joint name="t_block_p8" type="fixed">
+    <parent link="t_block"/>
+    <child link="p8"/>
+    <origin xyz="0.025 -0.125 0" rpy="0 0 0"/>
+  </joint>
 
 </robot>
