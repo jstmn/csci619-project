@@ -36,3 +36,23 @@ def test_PushTEnv_smoke_test() -> None:
     # Try saving a video again, it should fail because the environment has not been stepped
     with pytest.raises(AssertionError):
         env.save_video("/tmp/test_PushTEnv_smoke_test_2.mp4")
+
+
+def test_step_executes_push_action() -> None:
+    env = PushTEnv(nenvs=1, record_video=False, visualize=False)
+    initial_t_pose = env.poses.copy()
+
+    action = Action(
+        face=np.array([[2]], dtype=np.int32),
+        contact_point=np.array([[0.5]], dtype=np.float64),
+        angle=np.array([[np.pi / 2]], dtype=np.float64),
+    )
+    env.step(action, n_sim_steps=100)
+
+    final_t_pose = env.poses.copy()
+    final_pusher_xy = np.asarray(
+        env._data.joint_positions[0, [env._pusher_x_idx, env._pusher_y_idx]]
+    )
+
+    assert np.linalg.norm(final_t_pose - initial_t_pose) > 1e-4
+    assert np.linalg.norm(final_pusher_xy - np.array([0.75, 0.75])) > 0.1
