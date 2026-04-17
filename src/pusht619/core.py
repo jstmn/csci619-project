@@ -58,7 +58,7 @@ class Action:
     face:           np.ndarray
     contact_point:  np.ndarray
     angle:          np.ndarray
-    push_distance:  np.ndarray
+    # push_distance:  np.ndarray
 
     @property
     def nenvs(self) -> int:
@@ -69,7 +69,7 @@ class Action:
             ("face",          self.face),
             ("contact_point", self.contact_point),
             ("angle",         self.angle),
-            ("push_distance", self.push_distance),
+            # ("push_distance", self.push_distance),
         ):
             assert isinstance(arr, np.ndarray), f"{name} must be np.ndarray"
             assert arr.shape == (self.nenvs, 1), f"{name} must be (nenvs, 1), got shape {arr.shape}"
@@ -80,13 +80,13 @@ class Action:
             f"contact_point must be float32 or float64, got {self.contact_point.dtype}"
         assert self.angle.dtype in [np.float32, np.float64], \
             f"angle must be float32 or float64, got {self.angle.dtype}"
-        assert self.push_distance.dtype in [np.float32, np.float64], \
-            f"push_distance must be float32 or float64, got {self.push_distance.dtype}"
+        # assert self.push_distance.dtype in [np.float32, np.float64], \
+        #     f"push_distance must be float32 or float64, got {self.push_distance.dtype}"
 
         n = len(self.face)
         assert len(self.contact_point) == n
         assert len(self.angle) == n
-        assert len(self.push_distance) == n
+        # assert len(self.push_distance) == n
 
         assert np.all((self.face >= 0) & (self.face <= 5)), \
             "face must be in {0, …, 5}"
@@ -94,8 +94,8 @@ class Action:
             "contact_point must be in [0, 1]"
         assert np.all((self.angle >= 0) & (self.angle <= np.pi)), \
             "angle must be in [0, π]"
-        assert np.all((self.push_distance >= 0) & (self.push_distance <= 0.1)), \
-            "push_distance must be in [0, 0.1]"
+        # assert np.all((self.push_distance >= 0) & (self.push_distance <= 0.1)), \
+        #     "push_distance must be in [0, 0.1]"
 
 
 @dataclass

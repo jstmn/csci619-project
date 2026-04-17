@@ -26,6 +26,150 @@
       </inertial>
     </link>
 
+    <link name="wall_left">
+      <gravity>false</gravity>
+      <pose>-0.01 0.75 0.025 0 0 0</pose>
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.2</ixx><iyy>0.2</iyy><izz>0.2</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="wall_left_collision">
+        <geometry>
+          <box><size>0.02 1.54 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="wall_left_visual">
+        <geometry>
+          <box><size>0.02 1.54 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>1.0 1.0 1.0 1.0</ambient>
+          <diffuse>1.0 1.0 1.0 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="wall_left_joint" type="revolute">
+      <parent>env_center</parent>
+      <child>wall_left</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>0</lower>
+          <upper>0</upper>
+        </limit>
+      </axis>
+    </joint>
+
+    <link name="wall_right">
+      <gravity>false</gravity>
+      <pose>1.51 0.75 0.025 0 0 0</pose>
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.2</ixx><iyy>0.2</iyy><izz>0.2</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="wall_right_collision">
+        <geometry>
+          <box><size>0.02 1.54 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="wall_right_visual">
+        <geometry>
+          <box><size>0.02 1.54 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>1.0 1.0 1.0 1.0</ambient>
+          <diffuse>1.0 1.0 1.0 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="wall_right_joint" type="revolute">
+      <parent>env_center</parent>
+      <child>wall_right</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>0</lower>
+          <upper>0</upper>
+        </limit>
+      </axis>
+    </joint>
+
+    <link name="wall_bottom">
+      <gravity>false</gravity>
+      <pose>0.75 -0.01 0.025 0 0 0</pose>
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.2</ixx><iyy>0.2</iyy><izz>0.2</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="wall_bottom_collision">
+        <geometry>
+          <box><size>1.54 0.02 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="wall_bottom_visual">
+        <geometry>
+          <box><size>1.54 0.02 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>1.0 1.0 1.0 1.0</ambient>
+          <diffuse>1.0 1.0 1.0 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="wall_bottom_joint" type="revolute">
+      <parent>env_center</parent>
+      <child>wall_bottom</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>0</lower>
+          <upper>0</upper>
+        </limit>
+      </axis>
+    </joint>
+
+    <link name="wall_top">
+      <gravity>false</gravity>
+      <pose>0.75 1.51 0.025 0 0 0</pose>
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.2</ixx><iyy>0.2</iyy><izz>0.2</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="wall_top_collision">
+        <geometry>
+          <box><size>1.54 0.02 0.05</size></box>
+        </geometry>
+      </collision>
+      <visual name="wall_top_visual">
+        <geometry>
+          <box><size>1.54 0.02 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>1.0 1.0 1.0 1.0</ambient>
+          <diffuse>1.0 1.0 1.0 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="wall_top_joint" type="revolute">
+      <parent>env_center</parent>
+      <child>wall_top</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>0</lower>
+          <upper>0</upper>
+        </limit>
+      </axis>
+    </joint>
+
     <!-- ==================== T-BLOCK ==================== -->
     <link name="t_block_x">
       <inertial>

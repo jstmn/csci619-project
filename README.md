@@ -46,7 +46,7 @@ B |                | D
 # - face: int in {0, 1, 2, 3, 4, 5}
 # - contact_point: float in [0, 1]
 # - angle: float in [0, pi]
-# - push_distance: float in [0, 0.1]
+# XX - push_distance: float in [0, 0.1] XX <- CURRENTLY DISABLED!!! Push distances makes things more complicated, compared to a uniform number of sim steps.
 # --
 # - The push direction is _into_ the block. 
 # - A contact point of 0 means the initial contact point is on the left edge of the block, 1 means it is on the right edge.
@@ -56,14 +56,14 @@ B |                | D
        |   ^
        |  /
        | /
-       |/       
-     A | 
+       |/
+     A |
        |
 
     ^ face: A=0
       contact_point = 0.5
       angle = 3*pi/2
-      push_distance = 0.1
+      XX push_distance = 0.1 XX
 
 
 
