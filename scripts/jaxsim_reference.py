@@ -1,6 +1,9 @@
 """
 python scripts/jaxsim_reference.py
+
+Note that this script is derived from https://github.com/gbionics/jaxsim/blob/main/examples/jaxsim_as_physics_engine_advanced.ipynb
 """
+
 
 import functools
 import os

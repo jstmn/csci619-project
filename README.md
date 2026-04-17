@@ -20,13 +20,51 @@ _________________
 # Links
 # - all p_i are on the xy plane (i.e. floor level)
 
-p4 _____________ p5
+p3 _____________ p4
 |                 |
-p3 _ p2     p7 _ p6
+p2 _ p1     p6 _ p5
      |     |
      |     |
      |     |
-     p1___ p8
+     p0___ p7
+
+
+# Faces
+# - A: 0, B: 1, C: 2, D: 3, E: 4, F: 5
+ 
+   _______ C ______
+B |                | D
+  |____       _____|
+       |     |
+       |     |
+     A |     | E
+       |_ F _|
+
+
+
+# Action representation
+# - face: int in {0, 1, 2, 3, 4, 5}
+# - contact_point: float in [0, 1]
+# - angle: float in [0, pi]
+# - push_distance: float in [0, 0.1]
+# --
+# - The push direction is _into_ the block. 
+# - A contact point of 0 means the initial contact point is on the left edge of the block, 1 means it is on the right edge.
+# - An angle of 0 means the push is parallel the face, pointing to the right of the face. Angle of pi means push parallel to the left of the face. pi/2 means pushing perpendicular to the face.
+# - A push distance of 0 means no push, 0.1 means pushing for 10cm
+
+       |   ^
+       |  /
+       | /
+       |/       
+     A | 
+       |
+
+    ^ face: A=0
+      contact_point = 0.5
+      angle = 3*pi/2
+      push_distance = 0.1
+
 
 
 # Reference frame:
@@ -62,7 +100,8 @@ pip install -e ".[dev]"
 
 ## Running the project
 
+* NOTE: If using claude code, make sure to enter into the conda environment first.
+
 ```bash
-# Run with claude code:
-! source ~/miniconda3/etc/profile.d/conda.sh && conda activate pusht619 && python scripts/jaxsim_reference.py
+python scripts/main.py
 ```
