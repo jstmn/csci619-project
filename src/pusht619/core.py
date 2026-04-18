@@ -98,17 +98,25 @@ _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 
 def _plan_push_jax(
     t_poses: jnp.ndarray,  # (nenvs, 3)  [x, y, theta]
-    face: jnp.ndarray,  # (nenvs,)    int
+    face: jnp.ndarray,  # (nenvs,) int  OR  (nenvs, 6) float face-weights
     contact_point: jnp.ndarray,  # (nenvs,)    float in [0, 1]
     angle: jnp.ndarray,  # (nenvs,)    float in [0, π]
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """JAX re-implementation of `_plan_push`.
 
-    Pure, differentiable w.r.t. `contact_point`, `angle`, and `t_poses`; the
-    gradient w.r.t. the integer `face` is zero (gather).
+    Pure and differentiable w.r.t. `contact_point`, `angle`, `t_poses`, and —
+    when `face` is passed as a `(nenvs, 6)` float array of per-face weights —
+    also w.r.t. `face`. A `(nenvs,)` int `face` behaves like a hard gather and
+    carries zero gradient.
     """
-    face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2)
-    face_ends = _FACE_END_POINTS_JAX[face]  # (nenvs, 2)
+    if face.ndim == 2:
+        # Soft face: (nenvs, 6) weights (e.g. softmax or one-hot) → convex
+        # combination of the 6 face start/end points. Differentiable.
+        face_starts = face @ _FACE_START_POINTS_JAX  # (nenvs, 2)
+        face_ends = face @ _FACE_END_POINTS_JAX  # (nenvs, 2)
+    else:
+        face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2)
+        face_ends = _FACE_END_POINTS_JAX[face]  # (nenvs, 2)
     face_vectors = face_ends - face_starts
     face_lengths = jnp.linalg.norm(face_vectors, axis=1, keepdims=True)
     face_tangents = face_vectors / face_lengths
@@ -872,6 +880,58 @@ class PushTEnv:
             self._model,
             data,
             jnp.asarray(face).astype(jnp.int32),
+            jnp.asarray(contact_point).astype(jnp.float64),
+            jnp.asarray(angle).astype(jnp.float64),
+            jnp.asarray(target_xy).astype(jnp.float64),
+            self._pinned_base_position,
+            self._pinned_base_quaternion,
+            self._pinned_base_linear_velocity,
+            self._pinned_base_angular_velocity,
+            self._pinned_joint_positions,
+            self._static_joint_mask,
+            self._pusher_x_idx,
+            self._pusher_y_idx,
+            self._T_x_idx,
+            self._T_y_idx,
+            self._T_theta_idx,
+            self._nenvs,
+            approach_steps,
+            push_steps,
+            hold_steps,
+        )
+
+    def step_pure_soft(
+        self,
+        data: js.data.JaxSimModelData,
+        face_weights: jnp.ndarray,  # (nenvs, 6) float — per-face weights (e.g. softmax)
+        contact_point: jnp.ndarray,  # (nenvs,) float
+        angle: jnp.ndarray,  # (nenvs,) float
+        target_xy: jnp.ndarray | None = None,  # (nenvs, 2) float
+        n_sim_steps: int = 100,
+    ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Differentiable-face variant of :py:meth:`step_pure`.
+
+        Same returns as `step_pure`, but `face_weights` is a `(nenvs, 6)` float
+        array of per-face weights instead of an integer index. Internally,
+        planning takes a convex combination of the 6 face start/end points
+        (``weights @ face_points``), so gradients flow into `face_weights`.
+
+        Typical usage — optimise over unconstrained `face_logits` and map to
+        weights with `jax.nn.softmax(face_logits, axis=-1)`. Passing a one-hot
+        matrix recovers the hard-face behaviour (up to float precision).
+        """
+        assert n_sim_steps > 0, "n_sim_steps must be > 0"
+        assert face_weights.shape == (self._nenvs, 6), (
+            f"face_weights must be ({self._nenvs}, 6), got {face_weights.shape}"
+        )
+        if target_xy is None:
+            target_xy = jnp.asarray(self._target_poses[:, :2])
+
+        approach_steps, push_steps, hold_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
+        return _step_pure_impl(
+            self._model,
+            data,
+            jnp.asarray(face_weights).astype(jnp.float64),
             jnp.asarray(contact_point).astype(jnp.float64),
             jnp.asarray(angle).astype(jnp.float64),
             jnp.asarray(target_xy).astype(jnp.float64),

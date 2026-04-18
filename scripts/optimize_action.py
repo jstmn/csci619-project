@@ -25,13 +25,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pusht619.core import Action, PushTEnv
+from pusht619.core import Action, PushTEnv 
 
+jax.config.update("jax_enable_x64", True) #
 
 N_ENVS = 100
 N_SIM_STEPS = 50
-N_OPT_STEPS = 1000
-LR = 0.25
+N_OPT_STEPS = 100
+LR = 0.25 # too high?
 RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for variety.
 
 

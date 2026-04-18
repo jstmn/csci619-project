@@ -128,3 +128,86 @@ def test_step_pure_is_differentiable() -> None:
         f"finite-difference check failed: actual Δloss={actual_delta:.3e}, "
         f"expected ≈ {expected_delta:.3e} along the gradient direction"
     )
+
+
+# python -m pytest tests/test_core.py::test_step_pure_soft_matches_hard --capture=no
+def test_step_pure_soft_matches_hard() -> None:
+    """One-hot face_weights should reproduce the hard integer-face result."""
+    nenvs = 9  # must be a perfect square for env layout
+    n_sim_steps = 30
+
+    env = PushTEnv(nenvs=nenvs, record_video=False, visualize=False)
+    env.reset(seed=0)
+    data0 = env.data
+    target_xy = jnp.asarray(env.target_poses[:, :2])
+
+    # Cover all 6 faces + 3 repeats.
+    face_int = jnp.array([0, 1, 2, 3, 4, 5, 0, 2, 4], dtype=jnp.int32)
+    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float64)
+    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float64)
+
+    _, t_poses_hard, t_dists_hard, _ = env.step_pure(
+        data=data0,
+        face=face_int,
+        contact_point=contact_point,
+        angle=angle,
+        target_xy=target_xy,
+        n_sim_steps=n_sim_steps,
+    )
+
+    face_weights = jax.nn.one_hot(face_int, num_classes=6, dtype=jnp.float64)
+    _, t_poses_soft, t_dists_soft, _ = env.step_pure_soft(
+        data=data0,
+        face_weights=face_weights,
+        contact_point=contact_point,
+        angle=angle,
+        target_xy=target_xy,
+        n_sim_steps=n_sim_steps,
+    )
+
+    # Tiny numerical drift acceptable (matmul vs gather path through physics).
+    np.testing.assert_allclose(np.asarray(t_poses_hard), np.asarray(t_poses_soft), atol=1e-8)
+    np.testing.assert_allclose(np.asarray(t_dists_hard), np.asarray(t_dists_soft), atol=1e-8)
+
+
+# python -m pytest tests/test_core.py::test_step_pure_soft_is_differentiable_in_face --capture=no
+def test_step_pure_soft_is_differentiable_in_face() -> None:
+    """Gradient must flow into `face_weights` (the whole point of the soft path)."""
+    nenvs = 4
+    n_sim_steps = 50
+
+    env = PushTEnv(nenvs=nenvs, record_video=False, visualize=False)
+    env.reset(seed=0)
+    data0 = env.data
+    target_xy = jnp.asarray(env.target_poses[:, :2])
+
+    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float64)
+    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float64)
+    # Bias each env toward a different face so the softmaxed weights are sharp
+    # enough to put the pusher on an actual edge (uniform weights would land
+    # the contact point inside the T block and blow up physics).
+    face_logits = jnp.zeros((nenvs, 6), dtype=jnp.float64).at[jnp.arange(nenvs), jnp.array([0, 1, 2, 3])].set(5.0)
+
+    def cost(face_logits: jnp.ndarray) -> jnp.ndarray:
+        face_weights = jax.nn.softmax(face_logits, axis=-1)
+        _, _, t_distances, _ = env.step_pure_soft(
+            data=data0,
+            face_weights=face_weights,
+            contact_point=contact_point,
+            angle=angle,
+            target_xy=target_xy,
+            n_sim_steps=n_sim_steps,
+        )
+        return t_distances[:, -1].sum()
+
+    loss, g_logits = jax.jit(jax.value_and_grad(cost))(face_logits)
+
+    assert g_logits.shape == (nenvs, 6)
+    assert jnp.isfinite(loss), f"loss not finite: {loss}"
+    assert jnp.all(jnp.isfinite(g_logits)), f"g_logits has NaN/Inf: {g_logits}"
+
+    max_grad_magnitude = float(jnp.abs(g_logits).max())
+    assert max_grad_magnitude > 1e-8, (
+        f"face-weight gradients are identically zero; autodiff isn't flowing "
+        f"through the soft face gather (max |g| = {max_grad_magnitude:.3e})"
+    )
