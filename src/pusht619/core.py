@@ -692,6 +692,15 @@ class PushTEnv:
                 height=240 * 2,
             )
 
+    def get_context_vector(self, data) -> jnp.ndarray:
+        return jnp.concatenate([
+            jnp.stack([data.joint_positions[:, self._T_target_x_idx], data.joint_positions[:, self._T_target_y_idx], data.joint_positions[:, self._T_target_theta_idx]], axis=-1),  # target pose
+            jnp.stack([data.joint_positions[:, self._T_x_idx],  data.joint_positions[:, self._T_y_idx],  data.joint_positions[:, self._T_theta_idx]],  axis=-1),  # T pose
+            jnp.stack([data.joint_velocities[:, self._T_x_idx],  data.joint_velocities[:, self._T_y_idx],  data.joint_velocities[:, self._T_theta_idx]],  axis=-1),  # T velocity
+            jnp.stack([data.joint_positions[:, self._pusher_x_idx],  data.joint_positions[:, self._pusher_y_idx]],                 axis=-1),  # pusher xy
+        ], axis=-1)
+
+
     @property
     def nenvs(self) -> int:
         return self._nenvs
@@ -854,7 +863,6 @@ class PushTEnv:
         face: jnp.ndarray,  # (nenvs,) int
         contact_point: jnp.ndarray,  # (nenvs,) float
         angle: jnp.ndarray,  # (nenvs,) float
-        target_xy: jnp.ndarray | None = None,  # (nenvs, 2) float
         n_sim_steps: int = 100,
     ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Pure, jittable, differentiable single-action rollout.
@@ -872,9 +880,7 @@ class PushTEnv:
         ``angle`` (and optionally fields of ``data``).
         """
         assert n_sim_steps > 0, "n_sim_steps must be > 0"
-        if target_xy is None:
-            target_xy = jnp.asarray(self._target_poses[:, :2])
-
+        target_xy = jnp.asarray(self._target_poses[:, :2])
         approach_steps, push_steps, hold_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
         return _step_pure_impl(
             self._model,
@@ -1039,10 +1045,29 @@ class PushTEnv:
     def render(self) -> None:
         pass
 
-    def save_video(self, filename: str, delete_cache_after_saving: bool = True) -> None:
+    def save_video(self, filename: str) -> None:
+        """Write a video to filename."""
         assert self._record_video, "record_video must be True to save video"
         assert len(self._recorder.frames) > 0, "No frames to save"
-
         imageio.mimwrite(filename, self._recorder.frames, fps=self._recorder.fps)
-        if delete_cache_after_saving:
-            self._recorder.frames.clear()
+        self._recorder.frames.clear()
+
+    def save_video_from_jpos_traj(self, filename: str, jpos_traj: np.ndarray) -> None:
+        """Write a video to filename from a given joint position trajectory."""
+        base_pos_np = np.asarray(self._data.base_position)
+        base_quat_np = np.asarray(self._data.base_orientation)
+        joint_names = self._model.joint_names()
+        frames = []
+        for step_idx in range(jpos_traj.shape[1]):
+            for env_idx, helper in enumerate(self._mj_model_helpers):
+                helper.set_base_position(position=base_pos_np[env_idx])
+                helper.set_base_orientation(orientation=base_quat_np[env_idx])
+                helper.set_joint_positions(
+                    positions=jpos_traj[env_idx, step_idx],
+                    joint_names=joint_names,
+                )
+            frame = self._recorder.render_frame(camera_name="t_block_cam")
+            frames.append(frame)
+        assert len(frames) > 0, "No frames to save"
+        imageio.mimwrite(filename, frames, fps=self._recorder.fps)
+
