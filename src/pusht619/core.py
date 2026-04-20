@@ -693,13 +693,38 @@ class PushTEnv:
             )
 
     def get_context_vector(self, data) -> jnp.ndarray:
-        return jnp.concatenate([
-            jnp.stack([data.joint_positions[:, self._T_target_x_idx], data.joint_positions[:, self._T_target_y_idx], data.joint_positions[:, self._T_target_theta_idx]], axis=-1),  # target pose
-            jnp.stack([data.joint_positions[:, self._T_x_idx],  data.joint_positions[:, self._T_y_idx],  data.joint_positions[:, self._T_theta_idx]],  axis=-1),  # T pose
-            jnp.stack([data.joint_velocities[:, self._T_x_idx],  data.joint_velocities[:, self._T_y_idx],  data.joint_velocities[:, self._T_theta_idx]],  axis=-1),  # T velocity
-            jnp.stack([data.joint_positions[:, self._pusher_x_idx],  data.joint_positions[:, self._pusher_y_idx]],                 axis=-1),  # pusher xy
-        ], axis=-1)
-
+        return jnp.concatenate(
+            [
+                jnp.stack(
+                    [
+                        data.joint_positions[:, self._T_target_x_idx],
+                        data.joint_positions[:, self._T_target_y_idx],
+                        data.joint_positions[:, self._T_target_theta_idx],
+                    ],
+                    axis=-1,
+                ),  # target pose
+                jnp.stack(
+                    [
+                        data.joint_positions[:, self._T_x_idx],
+                        data.joint_positions[:, self._T_y_idx],
+                        data.joint_positions[:, self._T_theta_idx],
+                    ],
+                    axis=-1,
+                ),  # T pose
+                jnp.stack(
+                    [
+                        data.joint_velocities[:, self._T_x_idx],
+                        data.joint_velocities[:, self._T_y_idx],
+                        data.joint_velocities[:, self._T_theta_idx],
+                    ],
+                    axis=-1,
+                ),  # T velocity
+                jnp.stack(
+                    [data.joint_positions[:, self._pusher_x_idx], data.joint_positions[:, self._pusher_y_idx]], axis=-1
+                ),  # pusher xy
+            ],
+            axis=-1,
+        )
 
     @property
     def nenvs(self) -> int:
@@ -1070,4 +1095,3 @@ class PushTEnv:
             frames.append(frame)
         assert len(frames) > 0, "No frames to save"
         imageio.mimwrite(filename, frames, fps=self._recorder.fps)
-

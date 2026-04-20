@@ -30,9 +30,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pusht619.core import Action, PushTEnv 
+from pusht619.core import Action, PushTEnv
 
-jax.config.update("jax_enable_x64", True) #
+jax.config.update("jax_enable_x64", True)  #
+
 
 class MLP:
     """Maps a context vector to two unconstrained action parameters (u_contact, u_angle).
@@ -55,9 +56,7 @@ class MLP:
             params.append((w, b))
         return params
 
-    def apply(
-        self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray
-    ) -> jnp.ndarray:
+    def apply(self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray) -> jnp.ndarray:
         """Forward pass. Returns shape (..., 2) — columns are [u_contact, u_angle]."""
         for i, (w, b) in enumerate(params):
             x = x @ w + b

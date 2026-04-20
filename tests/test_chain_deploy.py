@@ -123,9 +123,7 @@ def test_chain_deploy_monotone_on_average():
 
 if __name__ == "__main__":
     if not CKPT_PATH.exists():
-        raise SystemExit(
-            f"No checkpoint at {CKPT_PATH}. Run `python scripts/training_loop.py` first."
-        )
+        raise SystemExit(f"No checkpoint at {CKPT_PATH}. Run `python scripts/training_loop.py` first.")
     print("=" * 70)
     print(f"Chained deployment  ({N_ENVS} envs × {N_PUSHES} pushes, seed={SEED})")
     print("=" * 70)
