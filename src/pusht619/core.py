@@ -11,6 +11,7 @@ level (z = 0) in the body frame defined in the URDF / README.
 import copy
 from dataclasses import dataclass
 import pathlib
+from re import A
 import numpy as np
 import functools
 from typing import Any
@@ -123,9 +124,10 @@ _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 
 def _plan_push_jax(
     t_poses: jnp.ndarray,  # (nenvs, 3)  [x, y, theta]
-    face: jnp.ndarray,  # (nenvs,) int  OR  (nenvs, 6) float face-weights
+    face: jnp.ndarray,  # (nenvs,) int
     contact_point: jnp.ndarray,  # (nenvs,)  must lie in CONTACT_POINT_BOUNDS
     angle: jnp.ndarray,  # (nenvs,)  must lie in ANGLE_BOUNDS
+    nenvs: int,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """JAX re-implementation of `_plan_push`.
 
@@ -134,14 +136,13 @@ def _plan_push_jax(
     also w.r.t. `face`. A `(nenvs,)` int `face` behaves like a hard gather and
     carries zero gradient.
     """
-    if face.ndim == 2:
-        # Soft face: (nenvs, 6) weights (e.g. softmax or one-hot) → convex
-        # combination of the 6 face start/end points. Differentiable.
-        face_starts = face @ _FACE_START_POINTS_JAX  # (nenvs, 2)
-        face_ends = face @ _FACE_END_POINTS_JAX  # (nenvs, 2)
-    else:
-        face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2)
-        face_ends = _FACE_END_POINTS_JAX[face]  # (nenvs, 2)
+    assert t_poses.shape == (nenvs, 3), f"t_poses must be (nenvs, 3), got {t_poses.shape}"
+    assert face.shape == (nenvs,), f"face must be (nenvs,), got {face.shape}"
+    assert contact_point.shape == (nenvs,), f"contact_point must be (nenvs,), got {contact_point.shape}"
+    assert angle.shape == (nenvs,), f"angle must be (nenvs,), got {angle.shape}"
+
+    face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2)
+    face_ends = _FACE_END_POINTS_JAX[face]  # (nenvs, 2)
     face_vectors = face_ends - face_starts
     face_lengths = jnp.linalg.norm(face_vectors, axis=1, keepdims=True)
     face_tangents = face_vectors / face_lengths
@@ -157,8 +158,20 @@ def _plan_push_jax(
         ],
         axis=1,
     )
+    assert t_poses.shape[1:] == (3,), f"t_poses must be (nenvs, 3), got {t_poses.shape}"
+    assert rotation_matrices.shape[1:] == (2, 2), (
+        f"rotation_matrices must be (nenvs, 2, 2), got {rotation_matrices.shape}"
+    )
+    assert contact_body.shape[1:] == (2,), f"contact_body must be (nenvs, 2), got {contact_body.shape}"
+    assert push_direction_body.shape[1:] == (2,), (
+        f"push_direction_body must be (nenvs, 2), got {push_direction_body.shape}"
+    )
     contact_world = t_poses[:, :2] + jnp.einsum("nij,nj->ni", rotation_matrices, contact_body)
     push_direction_world = jnp.einsum("nij,nj->ni", rotation_matrices, push_direction_body)
+    assert contact_world.shape[1:] == (2,), f"contact_world must be (nenvs, 2), got {contact_world.shape}"
+    assert push_direction_world.shape[1:] == (2,), (
+        f"push_direction_world must be (nenvs, 2), got {push_direction_world.shape}"
+    )
     push_direction_world = push_direction_world / jnp.linalg.norm(push_direction_world, axis=1, keepdims=True)
 
     pre_contact = contact_world - (PUSHER_RADIUS + PUSHER_CLEARANCE) * push_direction_world
@@ -469,7 +482,7 @@ def _step_pure_impl(
     T_y = data.joint_positions[:, T_y_idx]
     T_theta = data.joint_positions[:, T_theta_idx]
     t_poses_now = jnp.stack([T_x, T_y, T_theta], axis=-1)
-    pusher_start, pre_contact, push_direction = _plan_push_jax(t_poses_now, face, contact_point, angle)
+    pusher_start, pre_contact, push_direction = _plan_push_jax(t_poses_now, face, contact_point, angle, nenvs)
 
     # ── Pusher teleport + velocity reset ────────────────────────────────
     jp = data.joint_positions.at[:, pusher_x_idx].set(pusher_start[:, 0])
@@ -743,7 +756,6 @@ class PushTEnv:
                 height=1280,
             )
 
-
     @property
     def nenvs(self) -> int:
         return self._nenvs
@@ -774,7 +786,6 @@ class PushTEnv:
     @property
     def model(self) -> js.model.JaxSimModel:
         return self._model
-
 
     def get_context_vector(self, data) -> jnp.ndarray:
         return jnp.concatenate(
@@ -809,7 +820,6 @@ class PushTEnv:
             ],
             axis=-1,
         )
-
 
     def _sync_visualizer(self) -> None:
         if self._visualizer is None:
@@ -850,7 +860,9 @@ class PushTEnv:
         self._update_multi_env_data(base_position, base_orientation, joint_positions)
         self._visualizer.sync(self._viewer)
 
-    def reset(self, seed: int | None = None) -> np.ndarray:
+    def reset(
+        self, seed: int | None = None, target_poses: np.ndarray | None = None, t_poses: np.ndarray | None = None
+    ) -> np.ndarray:
         """
         Reset all environments to random orientations at the origin.
         Returns poses (nenvs, 3).
@@ -860,15 +872,26 @@ class PushTEnv:
         rng = np.random.default_rng(seed)
 
         # First, set randomized poses for the T and target T
-        self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
-        self._target_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
-        self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
-        self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+        if target_poses is None:
+            self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
+            self._target_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+            self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+            self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+        else:
+            assert target_poses.shape == (self._nenvs, 3), (
+                f"target_poses must be ({self._nenvs}, 3), got {target_poses.shape}"
+            )
+            self._target_poses = target_poses
+
         #
-        self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
-        self._t_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
-        self._t_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
-        self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+        if t_poses is None:
+            self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
+            self._t_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+            self._t_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+            self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+        else:
+            assert t_poses.shape == (self._nenvs, 3), f"t_poses must be ({self._nenvs}, 3), got {t_poses.shape}"
+            self._t_poses = t_poses
 
         # Reset video frames
         self._frames = []
@@ -1149,6 +1172,10 @@ class PushTEnv:
     def save_video_from_jpos_traj(self, filename: str, jpos_traj: np.ndarray) -> None:
         """Write a video to filename from a given joint position trajectory."""
         assert self._record_video, "record_video must be True to save video"
+        assert isinstance(filename, str), f"filename must be a string, got {type(filename)}"
+        assert isinstance(jpos_traj, (np.ndarray, jax.Array)), (
+            f"jpos_traj must be a numpy array or jax array, got {type(jpos_traj)}"
+        )
         base_pos_np = np.asarray(self._data.base_position)
         base_quat_np = np.asarray(self._data.base_orientation)
         frames = []

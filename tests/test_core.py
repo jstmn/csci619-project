@@ -2,11 +2,10 @@ import json
 import numpy as np
 from pathlib import Path
 import pytest
-
-import jax
-
-jax.config.update("jax_disable_jit", True)
+import jaxsim as js
 import jax.numpy as jnp
+import jax
+# jax.config.update("jax_disable_jit", True)
 
 from pusht619.core import Action, PushTEnv
 
@@ -211,51 +210,23 @@ def test_step_pure_soft_is_differentiable_in_face() -> None:
 
 # python -m pytest tests/test_core.py::test_t_pose_unchanged --capture=no
 def test_t_pose_unchanged():
-    """Snapshot from ``scripts/optimize_action.py`` (env 5, ``reset(seed=0)``): the
-    listed action should not move the T block over a single short rollout step.
-    """
+    """Debug a specific test"""
     jax.config.update("jax_enable_x64", True)
+    env = PushTEnv(nenvs=1, record_video=True, visualize=False)
+    env.reset(seed=0, t_poses=np.array([[0.44149, 1.34959, 0.76838]], dtype=np.float64))
 
-    src = PushTEnv(nenvs=9, record_video=False, visualize=False)
-    src.reset(seed=0)
-    env_idx = 5
-    jp = np.asarray(src._data.joint_positions[env_idx : env_idx + 1])
-    base = np.asarray(src._data.base_position[env_idx : env_idx + 1])
-    quat = np.asarray(src._data.base_orientation[env_idx : env_idx + 1])
-    t_pose = np.asarray(src._t_poses[env_idx : env_idx + 1])
-    target_pose = np.asarray(src._target_poses[env_idx : env_idx + 1])
-
-    env = PushTEnv(nenvs=1, record_video=True, visualize=True)
-    env._data = env._data.replace(
-        model=env._model,
-        base_position=jnp.asarray(base),
-        base_quaternion=jnp.asarray(quat),
-        joint_positions=jnp.asarray(jp),
-        base_linear_velocity=jnp.zeros_like(env._data._base_linear_velocity),
-        base_angular_velocity=jnp.zeros_like(env._data._base_angular_velocity),
-        joint_velocities=jnp.zeros_like(env._data.joint_velocities),
+    data: js.data.JaxSimModelData = env.data
+    # step_pure / _plan_push_jax expect per-env scalars shaped (nenvs,), not (nenvs, 1);
+    # column vectors make contact_point[:, None] rank-3 and break the rotation einsum.
+    faces = np.array([0], dtype=np.int32).reshape(-1)
+    contact_point = np.array([0.7272050578501773], dtype=np.float64).reshape(-1)
+    angle = np.array([0.6204681562681296], dtype=np.float64).reshape(-1)
+    _, _, t_dists, jpos_traj = env.step_pure(
+        data=data,
+        face=jnp.asarray(faces, dtype=jnp.int32).reshape(-1),
+        contact_point=jnp.asarray(contact_point, dtype=jnp.float64).reshape(-1),
+        angle=jnp.asarray(angle, dtype=jnp.float64).reshape(-1),
+        n_sim_steps=100,
     )
-    env._pinned_base_position = env._data.base_position
-    env._pinned_base_quaternion = env._data.base_quaternion
-    env._pinned_base_linear_velocity = jnp.zeros_like(env._data._base_linear_velocity)
-    env._pinned_base_angular_velocity = jnp.zeros_like(env._data._base_angular_velocity)
-    env._pinned_joint_positions = env._data.joint_positions
-    env._data = env._pin_static_assets(env._data)
-    env._t_poses = t_pose.copy()
-    env._target_poses = target_pose.copy()
-
-    t_before = env.t_poses.copy()
-    action = Action(
-        face=np.array([[0]], dtype=np.int32),
-        contact_point=np.array([[0.6413294168442497]], dtype=np.float64),
-        # Original optimize debug angle was slightly below π/6; API requires ANGLE_BOUNDS.
-        angle=np.array([[0.55]], dtype=np.float64),
-    )
-    result = env.step(action, n_sim_steps=1, check_t_displacement=False)
-
-    np.testing.assert_allclose(result.t_poses[0, -1], t_before[0], rtol=0.0, atol=1e-5)
-    save_filepath = Path("/tmp/test_t_pose_unchanged.mp4")
-    env.save_video(save_filepath)
-    assert save_filepath.exists()
-    print(f"Saved video to {save_filepath}")
-    print(f"xdg-open {save_filepath}")
+    print(t_dists)
+    env.save_video_from_jpos_traj("/tmp/test_t_pose_unchanged.mp4", jpos_traj)

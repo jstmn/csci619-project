@@ -86,9 +86,9 @@ VERBOSE = False
 def main(random_side: bool, random_t_pose: bool, record_video: bool):
     env = PushTEnv(nenvs=N_ENVS, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
-    now = datetime.now().strftime("%H:%M:%S")
     if record_video:
-        video_dir = Path(f"videos/")
+        now = datetime.now().strftime("%d__%H:%M:%S")
+        video_dir = Path(f"videos/{now}")
         video_dir.mkdir(parents=True, exist_ok=True)
 
     # Context vector (dim=11): T_target_pose(3) | T_pose(3) | T_velocity(3) | pusher_xy(2)
@@ -177,7 +177,7 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
 
         # Save videos
         if record_video:
-            save_filepath = video_dir / f"{now}__learned_action_{it:03d}.mp4"
+            save_filepath = video_dir / f"{it:03d}.mp4"
             env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
             if VERBOSE:
                 print(f"  saved {save_filepath}")
@@ -222,7 +222,7 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
     ax2.set_ylabel("Distance Standard Deviation [m]")
     ax2.grid(True, alpha=0.3)
     fig.tight_layout()
-    plt.savefig(f"videos/{now}__optimization.png", bbox_inches="tight")
+    plt.savefig(video_dir / "optimization.png", bbox_inches="tight")
     plt.close()
 
 
