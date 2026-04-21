@@ -71,12 +71,8 @@ LR_HYBRID_ACTION = 0.25
 
 EVAL_EVERY = 10
 N_EVAL_ENVS = 16
-CKPT_PATH = Path("//Users/rirando/Documents/CSCI 619 Project/csci619-project/surco_prior_params.npz")
+CKPT_PATH = Path("checkpoints/surco_prior_params.npz")
 
-# Eval video output. One file per eval call, named with the epoch so you get
-# a progression you can scrub through. Created at the start of train_prior().
-EVAL_VIDEO_DIR = Path("/Users/rirando/Documents/CSCI 619 Project/csci619-project/surco_eval_videos")
-EVAL_VIDEO_SEED = 1234  # fixed seed so all eval videos show the same scenes
 
 N_FACES = 6
 # ── 1. Gurobi: the combinatorial solver g_Ω ───────────────────────────────────
