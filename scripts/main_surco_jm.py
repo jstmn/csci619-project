@@ -57,7 +57,7 @@ System design (SurCo-prior):
 
 Run:
     python scripts/main_surco_jm.py --random-t-pose --verbosity 1
-    python scripts/main_surco_jm.py --verbosity 1 --record-video
+    python scripts/main_surco_jm.py --verbosity 1 --record-video --n-envs 9
 """
 
 from __future__ import annotations
@@ -85,10 +85,8 @@ from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-VERBOSITY = 0
 N_OPT_STEPS = 50
 LR = 0.1
-N_ENVS = 9
 N_SIM_STEPS = 50
 RESET_SEED = 0
 N_FACES = 6
@@ -274,14 +272,81 @@ class MLP:
         return jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
 
 
+
+def plot_results(save_dir, means, stds, face_hist, cp_hist, ang_hist, n_envs, n_sim_steps, n_opt_steps, random_t_pose):
+    initial_mean_dist = means[0]
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    fig.suptitle(
+        f"SurCo-prior  n_envs={n_envs}  n_sim_steps={n_sim_steps}  "
+        f"n_opt_steps={n_opt_steps}  K={RANDOMZED_SMOOTHING_K}  λ={PERTURB_LAMBDA}  "
+        f"RANDOM_T_POSE={random_t_pose}"
+    )
+    ax_mean, ax_std = axes[0, 0], axes[0, 1]
+    ax_cp, ax_ang = axes[1, 0], axes[1, 1]
+    ax_face = axes[2, 0]
+    axes[2, 1].set_visible(False)
+
+    ax_mean.axhline(float(initial_mean_dist), label="initial mean", color="black", linestyle="--")
+    ax_mean.plot(means, label="mean")
+    ax_mean.legend()
+    ax_mean.set_title("Mean Distance")
+    ax_mean.set_xlabel("Iteration")
+    ax_mean.set_ylabel("Distance [m]")
+    ax_mean.grid(True, alpha=0.3)
+
+    ax_std.plot(stds, label="std")
+    ax_std.legend()
+    ax_std.set_title("Standard Deviation")
+    ax_std.set_xlabel("Iteration")
+    ax_std.set_ylabel("Std [m]")
+    ax_std.grid(True, alpha=0.3)
+
+    for env_idx in range(min(n_envs, 3)):
+        ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}")
+        ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}")
+        ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}")
+
+    lo_cp, hi_cp = CONTACT_POINT_BOUNDS
+    lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
+    ax_cp.axhline(lo_cp, color="gray", linestyle="--", linewidth=0.8)
+    ax_cp.axhline(hi_cp, color="gray", linestyle="--", linewidth=0.8)
+    ax_cp.legend()
+    ax_cp.set_title("Contact Point")
+    ax_cp.set_xlabel("Iteration")
+    ax_cp.set_ylabel("contact_point")
+    ax_cp.grid(True, alpha=0.3)
+
+    ax_ang.axhline(lo_ang, color="gray", linestyle="--", linewidth=0.8)
+    ax_ang.axhline(hi_ang, color="gray", linestyle="--", linewidth=0.8)
+    ax_ang.legend()
+    ax_ang.set_title("Angle")
+    ax_ang.set_xlabel("Iteration")
+    ax_ang.set_ylabel("angle [rad]")
+    ax_ang.grid(True, alpha=0.3)
+
+    ax_face.set_yticks(range(N_FACES))
+    ax_face.legend()
+    ax_face.set_title("Face Chosen (argmax)")
+    ax_face.set_xlabel("Iteration")
+    ax_face.set_ylabel("face index")
+    ax_face.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    save_filepath = save_dir / "surco_prior.png"
+    plt.savefig(save_filepath, bbox_inches="tight")
+    print(f"Saved plot to {save_filepath}")
+    print(f"xdg-open {save_filepath}")
+    plt.close()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
-def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: bool):
+def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, record_video: bool):
     assert problem_type in ["single_step"], "Only single step problem is supported for now."
     assert verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
 
-    env = PushTEnv(nenvs=N_ENVS, record_video=record_video, visualize=False)
+    env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
     save_dir = Path(f"videos/{now}__{problem_type}__SurCo-prior")
@@ -291,8 +356,8 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     params = mlp.init(jax.random.PRNGKey(0))
 
     def cost(params, data, rng_solve):
-        ctx = env.get_context_vector(data)  # (N_ENVS, 11)
-        c = mlp.apply(params, ctx)  # (N_ENVS, 8) face logits + bounded targets
+        ctx = env.get_context_vector(data)  # (n_envs, 11)
+        c = mlp.apply(params, ctx)  # (n_envs, 8) face logits + bounded targets
 
         if verbosity > 1:
             jax.debug.print(
@@ -304,7 +369,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
         # Do one clean forward solve/rollout. The only smoothing Monte Carlo lives
         # in milp_solver's custom VJP, where it estimates dL/dc.
-        x_star = milp_solver(c, rng_solve, verbosity)  # (N_ENVS, 8)
+        x_star = milp_solver(c, rng_solve, verbosity)  # (n_envs, 8)
         face_onehot = x_star[:, :N_FACES]
         contact_point = x_star[:, 6]
         angle = x_star[:, 7]
@@ -356,9 +421,9 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
     means = []
     stds = []
-    face_hist = []  # list of (N_ENVS,) int — argmax face per env per iter
-    cp_hist = []  # list of (N_ENVS,) float — contact_point per env per iter
-    ang_hist = []  # list of (N_ENVS,) float — angle per env per iter
+    face_hist = []  # list of (n_envs,) int — argmax face per env per iter
+    cp_hist = []  # list of (n_envs,) float — contact_point per env per iter
+    ang_hist = []  # list of (n_envs,) float — angle per env per iter
 
     initial_mean_dist = None
     t_start = time()
@@ -381,7 +446,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
         (loss, (t_distances, jpos_traj, face_onehot, cp_batch, ang_batch)), g_raw = cost_and_grad(
             params, env_data_0, step_key
         )
-
+        final_dists_np = np.asarray(t_distances[:, -1])
         n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for layer in g_raw for x in layer)
         g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
         params = jax.tree.map(lambda p, g: p - LR * g, params, g_params)
@@ -390,33 +455,36 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
         if initial_mean_dist is None:
             initial_mean_dist = loss
 
-        print(f"mean dist: {loss:.6f} [m] | delta from initial: {100 * (loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms")
 
         if n_bad_grads > 0:
             cprint(
-                f"  WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).",
+                f"WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).",
                 "red",
             )
+
+        delta_cm = 100 * (loss - initial_mean_dist)
+        color = "green" if delta_cm < 0 else "red"
+        cprint(f"|____ mean dist: {loss:.6f} [m] | delta from initial: {delta_cm:.4f} [cm] | {dt * 1000:.1f} ms", color)
+        n_envs_better = sum(final_dists_np < initial_mean_dist - 0.05)
+        cprint(f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean", "yellow")
 
         if verbosity > 0:
             grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
             mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
             std_change = jnp.std(jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
-            cprint(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}", "yellow")
+            cprint(f"|____ max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}", "yellow")
 
-        final_dists_np = np.asarray(t_distances[:, -1])
         means.append(float(np.nanmean(final_dists_np)))
         stds.append(float(np.nanstd(final_dists_np)))
-        face_hist.append(np.asarray(jnp.argmax(face_onehot, axis=-1)))  # (N_ENVS,)
+        face_hist.append(np.asarray(jnp.argmax(face_onehot, axis=-1)))  # (n_envs,)
         cp_hist.append(np.asarray(cp_batch))
         ang_hist.append(np.asarray(ang_batch))
 
         if record_video:
             save_filepath = save_dir / f"{it:03d}.mp4"
             env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
-            if verbosity > 1:
-                cprint(f"  saved {save_filepath}", "green")
+            cprint(f"  Saved video to {save_filepath}", "green")
 
         nan_envs = np.where(np.isnan(final_dists_np))[0].tolist()
         if nan_envs:
@@ -429,76 +497,16 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     cprint(f"\nOptimization took {time() - t_start:.2f} s total", "green")
 
     # ── Plots ──────────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
-    fig.suptitle(
-        f"SurCo-prior  N_ENVS={N_ENVS}  N_SIM_STEPS={N_SIM_STEPS}  "
-        f"N_OPT_STEPS={N_OPT_STEPS}  K={RANDOMZED_SMOOTHING_K}  λ={PERTURB_LAMBDA}  "
-        f"RANDOM_T_POSE={random_t_pose}"
-    )
-    ax_mean, ax_std = axes[0, 0], axes[0, 1]
-    ax_cp, ax_ang = axes[1, 0], axes[1, 1]
-    ax_face = axes[2, 0]
-    axes[2, 1].set_visible(False)
-
-    ax_mean.axhline(float(initial_mean_dist), label="initial mean", color="black", linestyle="--")
-    ax_mean.plot(means, label="mean")
-    ax_mean.legend()
-    ax_mean.set_title("Mean Distance")
-    ax_mean.set_xlabel("Iteration")
-    ax_mean.set_ylabel("Distance [m]")
-    ax_mean.grid(True, alpha=0.3)
-
-    ax_std.plot(stds, label="std")
-    ax_std.legend()
-    ax_std.set_title("Standard Deviation")
-    ax_std.set_xlabel("Iteration")
-    ax_std.set_ylabel("Std [m]")
-    ax_std.grid(True, alpha=0.3)
-
-    for env_idx in range(min(N_ENVS, 3)):
-        ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}")
-        ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}")
-        ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}")
-
-    lo_cp, hi_cp = CONTACT_POINT_BOUNDS
-    lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
-    ax_cp.axhline(lo_cp, color="gray", linestyle="--", linewidth=0.8)
-    ax_cp.axhline(hi_cp, color="gray", linestyle="--", linewidth=0.8)
-    ax_cp.legend()
-    ax_cp.set_title("Contact Point")
-    ax_cp.set_xlabel("Iteration")
-    ax_cp.set_ylabel("contact_point")
-    ax_cp.grid(True, alpha=0.3)
-
-    ax_ang.axhline(lo_ang, color="gray", linestyle="--", linewidth=0.8)
-    ax_ang.axhline(hi_ang, color="gray", linestyle="--", linewidth=0.8)
-    ax_ang.legend()
-    ax_ang.set_title("Angle")
-    ax_ang.set_xlabel("Iteration")
-    ax_ang.set_ylabel("angle [rad]")
-    ax_ang.grid(True, alpha=0.3)
-
-    ax_face.set_yticks(range(N_FACES))
-    ax_face.legend()
-    ax_face.set_title("Face Chosen (argmax)")
-    ax_face.set_xlabel("Iteration")
-    ax_face.set_ylabel("face index")
-    ax_face.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    save_filepath = save_dir / "surco_prior.png"
-    plt.savefig(save_filepath, bbox_inches="tight")
-    print(f"Saved plot to {save_filepath}")
-    print(f"xdg-open {save_filepath}")
-    plt.close()
+    plot_results(save_dir, means, stds, face_hist, cp_hist, ang_hist, n_envs, N_SIM_STEPS, N_OPT_STEPS, random_t_pose)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--problem_type", type=str, default="single_step", choices=["single_step", "multi_step"])
     parser.add_argument("--verbosity", type=int, default=0)
+    parser.add_argument("--n-envs", type=int)
     parser.add_argument("--random-t-pose", action="store_true", help="Randomize problem instances each iteration")
     parser.add_argument("--record-video", action="store_true")
     args = parser.parse_args()
     VERBOSITY = args.verbosity
-    main(args.problem_type, args.verbosity, args.random_t_pose, args.record_video)
+    main(args.problem_type, args.n_envs, args.verbosity, args.random_t_pose, args.record_video)
