@@ -1,8 +1,10 @@
+import json
 import numpy as np
 from pathlib import Path
 import pytest
 
 import jax
+jax.config.update("jax_disable_jit", True)
 import jax.numpy as jnp
 
 from pusht619.core import Action, PushTEnv
@@ -211,3 +213,55 @@ def test_step_pure_soft_is_differentiable_in_face() -> None:
         f"face-weight gradients are identically zero; autodiff isn't flowing "
         f"through the soft face gather (max |g| = {max_grad_magnitude:.3e})"
     )
+
+
+# python -m pytest tests/test_core.py::test_t_pose_unchanged --capture=no
+def test_t_pose_unchanged():
+    """Snapshot from ``scripts/optimize_action.py`` (env 5, ``reset(seed=0)``): the
+    listed action should not move the T block over a single short rollout step.
+    """
+    jax.config.update("jax_enable_x64", True)
+
+    src = PushTEnv(nenvs=9, record_video=False, visualize=False)
+    src.reset(seed=0)
+    env_idx = 5
+    jp = np.asarray(src._data.joint_positions[env_idx : env_idx + 1])
+    base = np.asarray(src._data.base_position[env_idx : env_idx + 1])
+    quat = np.asarray(src._data.base_orientation[env_idx : env_idx + 1])
+    t_pose = np.asarray(src._t_poses[env_idx : env_idx + 1])
+    target_pose = np.asarray(src._target_poses[env_idx : env_idx + 1])
+
+    env = PushTEnv(nenvs=1, record_video=True, visualize=True)
+    env._data = env._data.replace(
+        model=env._model,
+        base_position=jnp.asarray(base),
+        base_quaternion=jnp.asarray(quat),
+        joint_positions=jnp.asarray(jp),
+        base_linear_velocity=jnp.zeros_like(env._data._base_linear_velocity),
+        base_angular_velocity=jnp.zeros_like(env._data._base_angular_velocity),
+        joint_velocities=jnp.zeros_like(env._data.joint_velocities),
+    )
+    env._pinned_base_position = env._data.base_position
+    env._pinned_base_quaternion = env._data.base_quaternion
+    env._pinned_base_linear_velocity = jnp.zeros_like(env._data._base_linear_velocity)
+    env._pinned_base_angular_velocity = jnp.zeros_like(env._data._base_angular_velocity)
+    env._pinned_joint_positions = env._data.joint_positions
+    env._data = env._pin_static_assets(env._data)
+    env._t_poses = t_pose.copy()
+    env._target_poses = target_pose.copy()
+
+    t_before = env.t_poses.copy()
+    action = Action(
+        face=np.array([[0]], dtype=np.int32),
+        contact_point=np.array([[0.6413294168442497]], dtype=np.float64),
+        # Original optimize debug angle was slightly below π/6; API requires ANGLE_BOUNDS.
+        angle=np.array([[0.55]], dtype=np.float64),
+    )
+    result = env.step(action, n_sim_steps=1, check_t_displacement=False)
+
+    np.testing.assert_allclose(result.t_poses[0, -1], t_before[0], rtol=0.0, atol=1e-5)
+    save_filepath = Path("/tmp/test_t_pose_unchanged.mp4")
+    env.save_video(save_filepath)
+    assert save_filepath.exists()
+    print(f"Saved video to {save_filepath}")
+    print(f"xdg-open {save_filepath}")

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from pusht619.core import Action, PushTEnv
+from pusht619.core import ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, Action, PushTEnv
 from scripts.training_loop import (
     CKPT_PATH,
     N_FACES,
@@ -85,8 +85,10 @@ def run_chain(
         c = SurCoPrior().apply(params, y)
         face_onehot = np.asarray(_solve_pure_callback(c[:, :N_FACES]))
         face = np.argmax(face_onehot, axis=-1).astype(np.int32).reshape(-1, 1)
-        contact = np.asarray(jax.nn.sigmoid(c[:, 6])).reshape(-1, 1)
-        angle = np.asarray(jnp.pi * jax.nn.sigmoid(c[:, 7])).reshape(-1, 1)
+        lo_cp, hi_cp = CONTACT_POINT_BOUNDS
+        lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
+        contact = np.asarray(lo_cp + (hi_cp - lo_cp) * jax.nn.sigmoid(c[:, 6])).reshape(-1, 1)
+        angle = np.asarray(lo_ang + (hi_ang - lo_ang) * jax.nn.sigmoid(c[:, 7])).reshape(-1, 1)
 
         result = env.step(
             Action(face=face, contact_point=contact, angle=angle),

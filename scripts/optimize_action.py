@@ -16,13 +16,14 @@ TODOS:
 
 # Run it:
 
-unset LD_LIBRARY_PATH
-python scripts/optimize_action.py
+unset LD_LIBRARY_PATH; python scripts/optimize_action.py
 """
 
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -32,7 +33,8 @@ import numpy as np
 
 from pusht619.core import Action, PushTEnv
 
-jax.config.update("jax_enable_x64", True)  #
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 
 
 class MLP:
@@ -65,9 +67,9 @@ class MLP:
         return x
 
 
-N_ENVS = 100
-N_SIM_STEPS = 50
-N_OPT_STEPS = 100
+N_ENVS = 9
+N_SIM_STEPS = 25
+N_OPT_STEPS = 10
 LR_ACTION = 0.25  # for u_contact / u_angle (smooth)
 RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for variety.
 
@@ -75,6 +77,9 @@ RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for varie
 def main():
     env = PushTEnv(nenvs=N_ENVS, record_video=True, visualize=False)
     env.reset(seed=RESET_SEED)
+    now = datetime.now().strftime("%H:%M:%S")
+    video_dir = Path(f"videos/")
+    video_dir.mkdir(parents=True, exist_ok=True)
 
     # Context vector (dim=11): T_target_pose(3) | T_pose(3) | T_velocity(3) | pusher_xy(2)
     mlp = MLP(context_dim=11)
@@ -83,9 +88,18 @@ def main():
     faces = jnp.asarray(rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32))
 
     def cost(params, data):
-        out = mlp.apply(params, env.get_context_vector(data))  # (N_ENVS, 2)
-        contact_point = jax.nn.sigmoid(out[:, 0])
-        angle = jnp.pi * jax.nn.sigmoid(out[:, 1])
+        ctx = env.get_context_vector(data)
+        out = mlp.apply(params, ctx)  # (N_ENVS, 2)
+        contact_point = 0.1 + 0.8 * jax.nn.sigmoid(out[:, 0])  # CONTACT_POINT_BOUNDS = (0.1, 0.9)
+        angle = jnp.pi / 6 + (4 * jnp.pi / 6) * jax.nn.sigmoid(out[:, 1])  # ANGLE_BOUNDS = (pi/6, 5*pi/6)
+
+        jax.debug.print("context  any_nan={n} min={lo:.3f} max={hi:.3f}", n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max())
+        jax.debug.print("mlp_out  any_nan={n}", n=jnp.any(jnp.isnan(out)))
+        jax.debug.print("contact_point, raw:  {pre}", pre=out[:, 0])
+        jax.debug.print("contact_point, post: {post}", post=contact_point)
+        jax.debug.print("angle        , raw:  {pre}", pre=out[:, 1])
+        jax.debug.print("angle        , post: {post}", post=angle)
+
         _, _, t_distances, jpos_traj = env.step_pure(
             data=data,
             face=faces[:, 0].astype(jnp.int32),
@@ -93,7 +107,10 @@ def main():
             angle=angle,
             n_sim_steps=N_SIM_STEPS,
         )
-        return t_distances[:, -1].mean(), (t_distances, jpos_traj)
+
+        jax.debug.print("t_dist   any_nan={n} final={d}",
+            n=jnp.any(jnp.isnan(t_distances)), d=t_distances[:, -1])
+        return t_distances[:, -1].mean(), (t_distances, jpos_traj, contact_point, angle)
 
     cost_and_grad = jax.jit(jax.value_and_grad(cost, argnums=0, has_aux=True))
 
@@ -103,15 +120,46 @@ def main():
         env.reset(seed=RESET_SEED)
 
         t0 = time.time()
-        (loss, (t_distances, jpos_traj)), g_params = cost_and_grad(params, env.data)
+        t_poses_0 = env.t_poses
+        env_data_0 = env.data
+        (loss, (t_distances, jpos_traj, contact_point, angle)), g_params = cost_and_grad(params, env_data_0)
         params = jax.tree.map(lambda p, g: p - LR_ACTION * g, params, g_params)
         dt = time.time() - t0
-        if it == 0 or (it + 1) % 5 == 0:
-            print(f"  iter {it + 1:4d}: mean dist = {loss:.4f} m  ({dt * 1000:.1f} ms)")
+        print()
+        print(f"  iter {it + 1:4d}: mean dist = {loss:.4f} m  ({dt * 1000:.1f} ms)")
 
-        save_filepath = Path(f"learned_action_{it:03d}.mp4")
+        # Check for NaNs in gradients
+        has_nan = any(jnp.any(jnp.isnan(g)).item() for layer in g_params for g in layer)
+        if has_nan:
+            print("  WARNING: NaN detected in gradients!")
+
+        # Check gradient statistics
+        grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
+        max_grad = max(jnp.max(g).item() for g in grad_abs_values)
+        mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR_ACTION * jnp.abs(g)).item() for g in grad_abs_values])).item()
+        std_change = jnp.std(jnp.array([jnp.std(LR_ACTION * jnp.abs(g)).item() for g in grad_abs_values])).item()
+        print(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}")
+
+        # Save videos
+        save_filepath = video_dir / f"{now}__learned_action_{it:03d}.mp4"
         env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
         print(f"  saved {save_filepath}")
+
+        # On NaN: save debug JSON + per-failing-env video
+        final_dists = np.asarray(t_distances[:, -1])
+        nan_envs = np.where(np.isnan(final_dists))[0].tolist()
+        if nan_envs:
+            for env_idx in nan_envs:
+                print(f"==== i: {env_idx} ====")
+                print("  T_pose before:       ", t_poses_0[env_idx])
+                print("  T_pose after:        ", env.t_poses[env_idx])
+                print("  contact_poin:        ", contact_point[env_idx])
+                print("  angle:               ", angle[env_idx])
+                print("  pusher position_0:   ", env_data_0.base_position[env_idx])
+                print("  pusher orientation_0:", env_data_0.base_orientation[env_idx])
+                print("  joint positions_0:   ", env_data_0.joint_positions[env_idx])
+                print("  joint velocities_0:  ", env_data_0.joint_velocities[env_idx])
+            exit()
 
     print(f"Optimization took {time.time() - t_start:.2f} s total")
 

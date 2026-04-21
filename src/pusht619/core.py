@@ -27,6 +27,32 @@ import mujoco as mj
 import rod
 
 
+# Action bounds (enforced on concrete :class:`Action` and checked every rollout in ``_step_pure_impl``).
+CONTACT_POINT_BOUNDS = (0.1, 0.9)
+ANGLE_BOUNDS = (jnp.pi / 6, 5 * jnp.pi / 6)
+
+
+def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
+    """Host callback: raises ``ValueError`` if any env has non-finite or out-of-range values."""
+    lo_cp, hi_cp = CONTACT_POINT_BOUNDS
+    lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
+    cp = np.asarray(cp, dtype=np.float64).reshape(-1)
+    ang = np.asarray(ang, dtype=np.float64).reshape(-1)
+    if cp.shape != ang.shape:
+        raise ValueError(f"contact_point and angle length mismatch: {cp.shape} vs {ang.shape}")
+    for name, arr, lo, hi in (
+        ("contact_point", cp, lo_cp, hi_cp),
+        ("angle", ang, lo_ang, hi_ang),
+    ):
+        ok = np.isfinite(arr) & (arr >= lo) & (arr <= hi)
+        bad = np.where(~ok)[0]
+        if len(bad):
+            raise ValueError(
+                f"{name} must be finite and in [{lo}, {hi}]; bad env indices {bad.tolist()} "
+                f"values {arr[bad].tolist()}"
+            )
+
+
 T_RADIUS = 0.15
 WORKSPACE_WIDTH = 1.5
 WORKSPACE_HEIGHT = 1.5
@@ -99,8 +125,8 @@ _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 def _plan_push_jax(
     t_poses: jnp.ndarray,  # (nenvs, 3)  [x, y, theta]
     face: jnp.ndarray,  # (nenvs,) int  OR  (nenvs, 6) float face-weights
-    contact_point: jnp.ndarray,  # (nenvs,)    float in [0, 1]
-    angle: jnp.ndarray,  # (nenvs,)    float in [0, π]
+    contact_point: jnp.ndarray,  # (nenvs,)  must lie in CONTACT_POINT_BOUNDS
+    angle: jnp.ndarray,  # (nenvs,)  must lie in ANGLE_BOUNDS
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """JAX re-implementation of `_plan_push`.
 
@@ -267,8 +293,8 @@ class Action:
 
       Fields (all shape (nenvs, 1)):
         face           int32  in {0, 1, 2, 3, 4, 5}
-        contact_point  float32 in [0, 1]   (0 = start corner, 1 = end corner)
-        angle          float32 in [0, π]   (0 = tangent, π/2 = into block)
+        contact_point  float32 in CONTACT_POINT_BOUNDS (parametrizes position along the chosen face edge)
+        angle          float32 in ANGLE_BOUNDS (push direction in the face frame)
         push_distance  float32 in [0, 0.1] (metres)
 
     Arrays may be either `np.ndarray` or `jax.Array`.  The validation runs only
@@ -307,11 +333,13 @@ class Action:
         if _is_concrete(self.contact_point):
             cp = np.asarray(self.contact_point)
             assert cp.dtype in (np.float32, np.float64), f"contact_point must be float32/float64, got {cp.dtype}"
-            assert np.all((cp >= 0) & (cp <= 1)), "contact_point must be in [0, 1]"
+            lo, hi = CONTACT_POINT_BOUNDS
+            assert np.all((cp >= lo) & (cp <= hi)), f"contact_point must be in [{lo}, {hi}]"
         if _is_concrete(self.angle):
             a = np.asarray(self.angle)
             assert a.dtype in (np.float32, np.float64), f"angle must be float32/float64, got {a.dtype}"
-            assert np.all((a >= 0) & (a <= np.pi)), "angle must be in [0, π]"
+            lo, hi = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
+            assert np.all((a >= lo) & (a <= hi)), f"angle must be in [{lo}, {hi}]"
 
 
 @dataclass
@@ -395,14 +423,15 @@ def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int, int]:
         "T_y_idx",
         "T_theta_idx",
         "nenvs",
+        "check_t_displacement",
     ),
 )
 def _step_pure_impl(
     model: js.model.JaxSimModel,
     data: js.data.JaxSimModelData,
     face: jnp.ndarray,  # (nenvs,) int
-    contact_point: jnp.ndarray,  # (nenvs,) float in [0, 1]
-    angle: jnp.ndarray,  # (nenvs,) float in [0, π]
+    contact_point: jnp.ndarray,  # (nenvs,)  must satisfy CONTACT_POINT_BOUNDS (checked below)
+    angle: jnp.ndarray,  # (nenvs,)  must satisfy ANGLE_BOUNDS (checked below)
     target_xy: jnp.ndarray,  # (nenvs, 2) float  —  used only to compute t_distances
     pinned_base_position: jnp.ndarray,  # (nenvs, 3)
     pinned_base_quaternion: jnp.ndarray,  # (nenvs, 4)
@@ -419,6 +448,7 @@ def _step_pure_impl(
     approach_steps: int,
     push_steps: int,
     hold_steps: int,
+    check_t_displacement: bool = True,
 ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fully pure, jittable, differentiable physics rollout for one action.
 
@@ -434,6 +464,9 @@ def _step_pure_impl(
     dt = model.time_step
 
     # ── Planning (all jnp) ─────────────────────────────────────────────
+    contact_point = jnp.asarray(contact_point, dtype=jnp.float64)
+    angle = jnp.asarray(angle, dtype=jnp.float64)
+    jax.debug.callback(_raise_unless_contact_angle_bounds, contact_point, angle)
     T_x = data.joint_positions[:, T_x_idx]
     T_y = data.joint_positions[:, T_y_idx]
     T_theta = data.joint_positions[:, T_theta_idx]
@@ -542,6 +575,20 @@ def _step_pure_impl(
     t_poses = jnp.swapaxes(t_poses_T, 0, 1)  # (nenvs, n_sim_steps, 3)
     t_dists = jnp.swapaxes(t_dists_T, 0, 1)  # (nenvs, n_sim_steps)
     jpos_traj = jnp.swapaxes(jpos_T, 0, 1)  # (nenvs, n_sim_steps, dofs)
+
+    # Optional sanity check: successful pushes should move the T block in xy.
+    if check_t_displacement:
+        t_displacement = jnp.linalg.norm(t_poses[:, -1, :2] - t_poses_now[:, :2], axis=-1)
+
+        def _assert_t_moved(disp: np.ndarray) -> None:
+            nan_envs = np.where(np.isnan(disp))[0]
+            if len(nan_envs):
+                print(f"WARNING: NaN displacement in envs {nan_envs} — physics diverged")
+            no_move = np.where(~np.isnan(disp) & (disp <= 1e-3))[0]
+            assert len(no_move) == 0, f"T block did not move in envs {no_move} (displacements: {disp})"
+
+        jax.debug.callback(_assert_t_moved, t_displacement)
+
     return data_final, t_poses, t_dists, jpos_traj
 
 
@@ -558,7 +605,7 @@ class PushTEnv:
         self._visualize = visualize
         self._visualizer = None
         self._viewer = None
-        self._poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
+        self._t_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
         self._target_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
         self._frames: list = []
 
@@ -628,8 +675,22 @@ class PushTEnv:
 
         self.reset()
 
-        if self._visualize:
-            mjcf_string, assets = jaxsim.mujoco.ModelToMjcf.convert(self._model.built_from)
+        if self._visualize or record_video:
+            _grid_span = spacing * (row_length - 1) + max(WORKSPACE_WIDTH, WORKSPACE_HEIGHT)
+            _cam_kwargs = dict(
+                lookat=[WORKSPACE_WIDTH / 2, WORKSPACE_HEIGHT / 2, 0.0],
+                distance=float(_grid_span / (2 * np.tan(np.deg2rad(22.5))) * 1.1),
+                azimuth=90,
+                elevation=-90,
+            )
+
+            convert_kwargs = {}
+            if record_video:
+                convert_kwargs["cameras"] = jaxsim.mujoco.loaders.MujocoCamera.build_from_target_view(
+                    camera_name="t_block_cam", **_cam_kwargs
+                )
+            mjcf_string, assets = jaxsim.mujoco.ModelToMjcf.convert(self._model.built_from, **convert_kwargs)
+
             parser = etree.XMLParser(remove_blank_text=True)
             root = etree.fromstring(text=mjcf_string.encode(), parser=parser)
             worldbody = root.find("worldbody")
@@ -654,42 +715,23 @@ class PushTEnv:
             self._mj_multi_model = mj.MjModel.from_xml_string(multi_xml, assets=assets)
             self._mj_multi_model.opt.gravity[:] = 0.0  # Prevent bodies drifting in MuJoCo physics step
             self._mj_multi_data = mj.MjData(self._mj_multi_model)
+
+        if self._visualize:
             self._visualizer = jaxsim.mujoco.MujocoVisualizer(model=self._mj_multi_model, data=self._mj_multi_data)
             self._viewer = self._visualizer.open_viewer()
-            jaxsim.mujoco.MujocoVisualizer.setup_viewer_camera(
-                self._viewer,
-                lookat=[WORKSPACE_WIDTH / 2, WORKSPACE_HEIGHT / 2, 0.1],
-                distance=3.0,
-                azimuth=150,
-                elevation=-30,
-            )
+            jaxsim.mujoco.MujocoVisualizer.setup_viewer_camera(self._viewer, **_cam_kwargs)
             self._sync_visualizer()
         else:
             self._visualizer = None
             self._viewer = None
 
         if record_video:
-            mjcf_string, assets = jaxsim.mujoco.ModelToMjcf.convert(
-                self._model.built_from,
-                cameras=jaxsim.mujoco.loaders.MujocoCamera.build_from_target_view(
-                    camera_name="t_block_cam",
-                    lookat=[0.75, 0.75, 0.1],
-                    distance=3.0,
-                    azimuth=150,
-                    elevation=-30,
-                ),
-            )
-
-            self._mj_model_helpers = [
-                jaxsim.mujoco.MujocoModelHelper.build_from_xml(mjcf_description=mjcf_string, assets=assets)
-                for _ in range(nenvs)
-            ]
             self._recorder = jaxsim.mujoco.MujocoVideoRecorder(
-                model=self._mj_model_helpers[0].model,
-                data=[helper.data for helper in self._mj_model_helpers],
+                model=self._mj_multi_model,
+                data=self._mj_multi_data,
                 fps=int(1 / self._model.time_step),
-                width=320 * 2,
-                height=240 * 2,
+                width=1280,
+                height=1280,
             )
 
     def get_context_vector(self, data) -> jnp.ndarray:
@@ -739,14 +781,12 @@ class PushTEnv:
             joint_positions=np.asarray(self._data.joint_positions),
         )
 
-    def _sync_visualizer_from_positions(
+    def _update_multi_env_data(
         self,
-        base_position: np.ndarray,  # (nenvs, 3)
-        base_orientation: np.ndarray,  # (nenvs, 4)
+        base_position: np.ndarray,   # (nenvs, 3)
+        base_orientation: np.ndarray, # (nenvs, 4)
         joint_positions: np.ndarray,  # (nenvs, dofs)
     ) -> None:
-        if self._visualizer is None:
-            return
         joint_names = self._model.joint_names()
         for i in range(self._nenvs):
             jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, f"world_to_base_{i}")
@@ -755,11 +795,20 @@ class PushTEnv:
                 self._mj_multi_data.qpos[qpos_adr : qpos_adr + 3] = base_position[i]
                 self._mj_multi_data.qpos[qpos_adr + 3 : qpos_adr + 7] = base_orientation[i]
             for orig_jnt_idx, jnt_name in enumerate(joint_names):
-                multi_jnt_name = f"{jnt_name}_{i}"
-                multi_jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, multi_jnt_name)
+                multi_jnt_id = mj.mj_name2id(self._mj_multi_model, mj.mjtObj.mjOBJ_JOINT, f"{jnt_name}_{i}")
                 if multi_jnt_id != -1:
                     qpos_adr = self._mj_multi_model.jnt_qposadr[multi_jnt_id]
                     self._mj_multi_data.qpos[qpos_adr] = joint_positions[i, orig_jnt_idx]
+
+    def _sync_visualizer_from_positions(
+        self,
+        base_position: np.ndarray,
+        base_orientation: np.ndarray,
+        joint_positions: np.ndarray,
+    ) -> None:
+        if self._visualizer is None:
+            return
+        self._update_multi_env_data(base_position, base_orientation, joint_positions)
         self._visualizer.sync(self._viewer)
 
     def reset(self, seed: int = 0) -> np.ndarray:
@@ -775,10 +824,10 @@ class PushTEnv:
         self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
         self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
         #
-        self._poses = np.zeros((self._nenvs, 3), dtype=np.float64)
-        self._poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
-        self._poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
-        self._poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+        self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
+        self._t_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+        self._t_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+        self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
 
         # Reset video frames
         self._frames = []
@@ -793,9 +842,9 @@ class PushTEnv:
 
         # Update joint positions for t_block and pusher
         new_joint_positions = jnp.zeros_like(self._data.joint_positions)
-        new_joint_positions = new_joint_positions.at[:, self._T_x_idx].set(self._poses[:, 0])
-        new_joint_positions = new_joint_positions.at[:, self._T_y_idx].set(self._poses[:, 1])
-        new_joint_positions = new_joint_positions.at[:, self._T_theta_idx].set(self._poses[:, 2])
+        new_joint_positions = new_joint_positions.at[:, self._T_x_idx].set(self._t_poses[:, 0])
+        new_joint_positions = new_joint_positions.at[:, self._T_y_idx].set(self._t_poses[:, 1])
+        new_joint_positions = new_joint_positions.at[:, self._T_theta_idx].set(self._t_poses[:, 2])
         new_joint_positions = new_joint_positions.at[:, self._T_target_x_idx].set(self._target_poses[:, 0])
         new_joint_positions = new_joint_positions.at[:, self._T_target_y_idx].set(self._target_poses[:, 1])
         new_joint_positions = new_joint_positions.at[:, self._T_target_theta_idx].set(self._target_poses[:, 2])
@@ -825,8 +874,8 @@ class PushTEnv:
         self._pinned_joint_positions = self._data.joint_positions
         zero_forces = jnp.zeros((self._nenvs, self._model.dofs()))
         self._data = step_parallel(self._model, self._data, zero_forces)
-        self._data = self._pin_base(self._data)
-        self._poses = np.column_stack(
+        self._data = self._pin_static_assets(self._data)
+        self._t_poses = np.column_stack(
             [
                 np.asarray(self._data.joint_positions[:, self._T_x_idx]),
                 np.asarray(self._data.joint_positions[:, self._T_y_idx]),
@@ -834,9 +883,9 @@ class PushTEnv:
             ]
         )
         self._sync_visualizer()
-        return self._poses.copy()
+        return self._t_poses.copy()
 
-    def _pin_base(self, data: js.data.JaxSimModelData) -> js.data.JaxSimModelData:
+    def _pin_static_assets(self, data: js.data.JaxSimModelData) -> js.data.JaxSimModelData:
         """Force env_center back to its fixed world pose with zero velocity
         and re-clamp the "static" joints (walls, target-T) to their reset
         values.  Needed because JaxSim's articulated dynamics let small
@@ -889,6 +938,8 @@ class PushTEnv:
         contact_point: jnp.ndarray,  # (nenvs,) float
         angle: jnp.ndarray,  # (nenvs,) float
         n_sim_steps: int = 100,
+        *,
+        check_t_displacement: bool = True,
     ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Pure, jittable, differentiable single-action rollout.
 
@@ -903,6 +954,10 @@ class PushTEnv:
         a full 100-step rollout.  The ``face`` argument is an integer index
         and carries zero gradient; differentiate w.r.t. ``contact_point`` and
         ``angle`` (and optionally fields of ``data``).
+
+        ``contact_point`` and ``angle`` must lie in :data:`CONTACT_POINT_BOUNDS` and
+        :data:`ANGLE_BOUNDS` (same as :meth:`step` / :class:`Action`); otherwise the
+        rollout raises ``ValueError``.
         """
         assert n_sim_steps > 0, "n_sim_steps must be > 0"
         target_xy = jnp.asarray(self._target_poses[:, :2])
@@ -929,6 +984,7 @@ class PushTEnv:
             approach_steps,
             push_steps,
             hold_steps,
+            check_t_displacement,
         )
 
     def step_pure_soft(
@@ -939,6 +995,8 @@ class PushTEnv:
         angle: jnp.ndarray,  # (nenvs,) float
         target_xy: jnp.ndarray | None = None,  # (nenvs, 2) float
         n_sim_steps: int = 100,
+        *,
+        check_t_displacement: bool = True,
     ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Differentiable-face variant of :py:meth:`step_pure`.
 
@@ -950,6 +1008,9 @@ class PushTEnv:
         Typical usage — optimise over unconstrained `face_logits` and map to
         weights with `jax.nn.softmax(face_logits, axis=-1)`. Passing a one-hot
         matrix recovers the hard-face behaviour (up to float precision).
+
+        ``contact_point`` and ``angle`` must lie in :data:`CONTACT_POINT_BOUNDS` and
+        :data:`ANGLE_BOUNDS`; otherwise the rollout raises ``ValueError``.
         """
         assert n_sim_steps > 0, "n_sim_steps must be > 0"
         assert face_weights.shape == (self._nenvs, 6), (
@@ -981,9 +1042,10 @@ class PushTEnv:
             approach_steps,
             push_steps,
             hold_steps,
+            check_t_displacement,
         )
 
-    def step(self, action: Action, n_sim_steps: int = 100) -> ActionResult:
+    def step(self, action: Action, n_sim_steps: int = 100, *, check_t_displacement: bool = True) -> ActionResult:
         """
         Stateful wrapper around :py:meth:`step_pure`.  Advances the internal
         simulation state by one action, handles visualization and video
@@ -1007,10 +1069,10 @@ class PushTEnv:
             face=face,
             contact_point=contact_point,
             angle=angle,
-            target_xy=jnp.asarray(self._target_poses[:, :2]),
             n_sim_steps=n_sim_steps,
+            check_t_displacement=check_t_displacement,
         )
-        self._poses = np.asarray(t_poses[:, -1, :])
+        self._t_poses = np.asarray(t_poses[:, -1, :])
 
         # ── Post-hoc replay into viz / recorder ────────────────────────
         if self._visualizer is not None or self._record_video:
@@ -1046,9 +1108,9 @@ class PushTEnv:
         )
 
     @property
-    def poses(self) -> np.ndarray:
+    def t_poses(self) -> np.ndarray:
         """Current poses (nenvs, 3) — read-only copy."""
-        return self._poses.copy()
+        return self._t_poses.copy()
 
     @property
     def target_poses(self) -> np.ndarray:
@@ -1067,9 +1129,6 @@ class PushTEnv:
     def model(self) -> js.model.JaxSimModel:
         return self._model
 
-    def render(self) -> None:
-        pass
-
     def save_video(self, filename: str) -> None:
         """Write a video to filename."""
         assert self._record_video, "record_video must be True to save video"
@@ -1079,18 +1138,12 @@ class PushTEnv:
 
     def save_video_from_jpos_traj(self, filename: str, jpos_traj: np.ndarray) -> None:
         """Write a video to filename from a given joint position trajectory."""
+        assert self._record_video, "record_video must be True to save video"
         base_pos_np = np.asarray(self._data.base_position)
         base_quat_np = np.asarray(self._data.base_orientation)
-        joint_names = self._model.joint_names()
         frames = []
         for step_idx in range(jpos_traj.shape[1]):
-            for env_idx, helper in enumerate(self._mj_model_helpers):
-                helper.set_base_position(position=base_pos_np[env_idx])
-                helper.set_base_orientation(orientation=base_quat_np[env_idx])
-                helper.set_joint_positions(
-                    positions=jpos_traj[env_idx, step_idx],
-                    joint_names=joint_names,
-                )
+            self._update_multi_env_data(base_pos_np, base_quat_np, jpos_traj[:, step_idx, :])
             frame = self._recorder.render_frame(camera_name="t_block_cam")
             frames.append(frame)
         assert len(frames) > 0, "No frames to save"
