@@ -34,7 +34,6 @@ from scripts.training_loop import (
     load_prior_params,
 )
 
-jax.config.update("jax_enable_x64", True)
 
 N_ENVS = 4
 N_PUSHES = 6
@@ -51,7 +50,7 @@ def _set_overhead_camera(env: PushTEnv, distance: float = 3.0):
     the workspace center, orientation = identity (mujoco cameras look along
     their local -Z, so identity quat = looking straight down with +Y up).
     """
-    lookat = np.array([0.75, 0.75, 0.1], dtype=np.float64)
+    lookat = np.array([0.75, 0.75, 0.1], dtype=np.float32)
     cam_pos = lookat + np.array([0.0, 0.0, distance])
     cam_quat = np.array([1.0, 0.0, 0.0, 0.0])  # identity
     for helper in env._mj_model_helpers:
@@ -76,7 +75,7 @@ def run_chain(
     env.reset(seed=seed)
     target_xy = jnp.asarray(env.target_poses[:, :2])
 
-    dist_history = np.zeros((n_envs, n_pushes + 1), dtype=np.float64)
+    dist_history = np.zeros((n_envs, n_pushes + 1), dtype=np.float32)
     t_xy0 = np.asarray(env._poses[:, :2])
     dist_history[:, 0] = np.linalg.norm(t_xy0 - np.asarray(target_xy), axis=-1)
 

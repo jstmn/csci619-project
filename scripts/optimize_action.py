@@ -17,7 +17,8 @@ TODOS:
 # Run it:
 
 unset LD_LIBRARY_PATH
-python scripts/optimize_action.py --random-side --random-t-pose --record-video
+python scripts/optimize_action.py --random-side --random-t-pose --record-video --verbosity 1
+python scripts/optimize_action.py --record-video --verbosity 1
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ import argparse
 
 from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
-jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 
 
@@ -59,8 +59,8 @@ class MLP:
         for i in range(len(self.layer_sizes) - 1):
             key, subkey = jax.random.split(key)
             fan_in, fan_out = self.layer_sizes[i], self.layer_sizes[i + 1]
-            w = jax.random.normal(subkey, (fan_in, fan_out), dtype=jnp.float64) * jnp.sqrt(2.0 / fan_in)
-            b = jnp.zeros(fan_out, dtype=jnp.float64)
+            w = jax.random.normal(subkey, (fan_in, fan_out), dtype=jnp.float32) * jnp.sqrt(2.0 / fan_in)
+            b = jnp.zeros(fan_out, dtype=jnp.float32)
             params.append((w, b))
         return params
 
@@ -75,15 +75,15 @@ class MLP:
         return x
 
 
-N_OPT_STEPS = 100
-LR = 0.5
+N_OPT_STEPS = 50
+LR = 2.0
 N_ENVS = 64
-N_SIM_STEPS = 100
+# N_ENVS = 9
+N_SIM_STEPS = 50
 RESET_SEED = 0
-VERBOSE = False
 
 
-def main(random_side: bool, random_t_pose: bool, record_video: bool):
+def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: int):
     env = PushTEnv(nenvs=N_ENVS, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
     if record_video:
@@ -101,7 +101,7 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
         out = mlp.apply(params, ctx)  # (N_ENVS, 2)
         contact_point, angle = out[:, 0], out[:, 1]
 
-        if VERBOSE:
+        if verbosity > 1:
             jax.debug.print(
                 "context  any_nan={n} min={lo:.3f} max={hi:.3f}", n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max()
             )
@@ -118,10 +118,14 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
             angle=angle,
             n_sim_steps=N_SIM_STEPS,
         )
-
-        if VERBOSE:
-            jax.debug.print("t_dist   any_nan={n} final={d}", n=jnp.any(jnp.isnan(t_distances)), d=t_distances[:, -1])
-        return t_distances[:, -1].mean(), (t_distances, jpos_traj, contact_point, angle)
+        assert t_distances.shape == (N_ENVS, N_SIM_STEPS), f"t_distances must be ({N_ENVS}, {N_SIM_STEPS}), got {t_distances.shape}"
+        # Mean final distance; NaNs from diverged rollouts are ignored (cannot use
+        # jnp.where(cond)[0] here — dynamic nonzero is illegal inside jit).
+        final_dists = t_distances[:, -1]
+        loss = jnp.nanmean(final_dists)
+        if verbosity > 0:
+            jax.debug.print("t_dist   sum(is_nan)={n} final_dists={d}", n=jnp.sum(jnp.isnan(final_dists)), d=final_dists)
+        return loss, (t_distances, jpos_traj, contact_point, angle)
 
     cost_and_grad = jax.jit(jax.value_and_grad(cost, argnums=0, has_aux=True))
 
@@ -130,6 +134,8 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
     stds = []
     maxs = []
     mins = []
+    angles = []
+    contact_points = []
     initial_mean_dist = None
     t_start = time.time()
     faces = rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32)
@@ -153,7 +159,7 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
             initial_mean_dist = loss
         print()
         print(
-            f"  ===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {loss - initial_mean_dist:.6f} [m] | {dt * 1000:.1f} ms"
+            f"===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {100*(loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms"
         )
 
         # Check for NaNs in gradients
@@ -162,7 +168,7 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
             cprint("  WARNING: NaN detected in gradients!", "red")
 
         # Check gradient statistics
-        if VERBOSE:
+        if verbosity > 0:
             grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
             mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
@@ -174,12 +180,14 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
         stds.append(t_distances[:, -1].std())
         maxs.append(t_distances[:, -1].max())
         mins.append(t_distances[:, -1].min())
+        angles.append(np.asarray(angle))
+        contact_points.append(np.asarray(contact_point))
 
         # Save videos
         if record_video:
             save_filepath = video_dir / f"{it:03d}.mp4"
             env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
-            if VERBOSE:
+            if verbosity > 1:
                 print(f"  saved {save_filepath}")
 
         # On NaN: save debug JSON + per-failing-env video
@@ -187,20 +195,30 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
         nan_envs = np.where(np.isnan(final_dists))[0].tolist()
         if nan_envs:
             for env_idx in nan_envs:
-                print(f"==== i: {env_idx} ====")
-                print("  T_pose before:       ", t_poses_0[env_idx])
-                print("  T_pose after:        ", env.t_poses[env_idx])
-                print("  contact_poin:        ", contact_point[env_idx])
-                print("  angle:               ", angle[env_idx])
-                print("  pusher position_0:   ", env_data_0.base_position[env_idx])
-                print("  pusher orientation_0:", env_data_0.base_orientation[env_idx])
-                print("  joint positions_0:   ", env_data_0.joint_positions[env_idx])
-                print("  joint velocities_0:  ", env_data_0.joint_velocities[env_idx])
-            exit()
+                print(f"  Env: {env_idx} - T distance is NaN")
+                print("    T_pose before:       ", t_poses_0[env_idx])
+                print("    T_pose after:        ", env.t_poses[env_idx])
+                print("    contact_poin:        ", contact_point[env_idx])
+                print("    angle:               ", angle[env_idx])
+                print("    pusher position_0:   ", env_data_0.base_position[env_idx])
+                print("    pusher orientation_0:", env_data_0.base_orientation[env_idx])
+                print("    joint positions_0:   ", env_data_0.joint_positions[env_idx])
+                print("    joint velocities_0:  ", env_data_0.joint_velocities[env_idx])
 
     print(f"Optimization took {time.time() - t_start:.2f} s total")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # ================================================
+    # Plot results
+    #
+    # Determine layout based on randomization settings
+    show_action_plots = not random_side and not random_t_pose
+    if show_action_plots:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        ax1, ax3 = axes[0, 0], axes[0, 1]
+        ax2, ax4 = axes[1, 0], axes[1, 1]
+    else:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     fig.suptitle(
         f"Optimization Results - N_ENVS={N_ENVS}, N_SIM_STEPS={N_SIM_STEPS}, N_OPT_STEPS={N_OPT_STEPS}, RANDOM_SIDE={random_side}, RANDOM_T_POSE={random_t_pose}"
@@ -221,8 +239,32 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool):
     ax2.set_xlabel("Iteration")
     ax2.set_ylabel("Distance Standard Deviation [m]")
     ax2.grid(True, alpha=0.3)
+
+    # If not randomizing, show angle and contact_point for first environment
+    if show_action_plots:
+        # Extract first environment's angle and contact_point over iterations
+        # angles and contact_points are lists of arrays with shape (nenvs, 1)
+        for env_idx in range(5):
+            env_angles = [a[env_idx] for a in angles]
+            env_contact_points = [cp[env_idx] for cp in contact_points]
+            ax3.plot(env_angles, label=f"Angle [env {env_idx}]")
+            ax4.plot(env_contact_points, label=f"Contact Point [env {env_idx}]")
+        ax3.legend()
+        ax3.set_title("Angle")
+        ax3.set_xlabel("Iteration")
+        ax3.set_ylabel("Angle [rad]")
+        ax3.grid(True, alpha=0.3)
+        ax4.legend()
+        ax4.set_title("Contact Point")
+        ax4.set_xlabel("Iteration")
+        ax4.set_ylabel("Contact Point")
+        ax4.grid(True, alpha=0.3)
+
     fig.tight_layout()
-    plt.savefig(video_dir / "optimization.png", bbox_inches="tight")
+    save_filepath = video_dir / "optimization.png"
+    plt.savefig(save_filepath, bbox_inches="tight")
+    print(f"Saved plot to {save_filepath}")
+    print(f"xdg-open {save_filepath}")
     plt.close()
 
 
@@ -231,5 +273,6 @@ if __name__ == "__main__":
     parser.add_argument("--random-side", action="store_true", help="Randomize the side of the target object")
     parser.add_argument("--random-t-pose", action="store_true", help="Randomize the target pose")
     parser.add_argument("--record-video", action="store_true", help="Record a video of the optimization process")
+    parser.add_argument("--verbosity", type=int, default=0, help="Verbosity level")
     args = parser.parse_args()
-    main(random_side=args.random_side, random_t_pose=args.random_t_pose, record_video=args.record_video)
+    main(random_side=args.random_side, random_t_pose=args.random_t_pose, record_video=args.record_video, verbosity=args.verbosity)

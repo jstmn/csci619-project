@@ -8,15 +8,14 @@ Faces (A-F) go around the perimeter of the T; corners p0-p7 are at floor
 level (z = 0) in the body frame defined in the URDF / README.
 """
 
+from pathlib import Path
 import copy
 from dataclasses import dataclass
-import pathlib
-from re import A
-import numpy as np
 import functools
 from typing import Any
-from lxml import etree
 
+import numpy as np
+from lxml import etree
 import imageio
 import jax
 import jax.numpy as jnp
@@ -29,16 +28,16 @@ import rod
 
 
 # Action bounds (enforced on concrete :class:`Action` and checked every rollout in ``_step_pure_impl``).
-CONTACT_POINT_BOUNDS = (0.1, 0.9)
-ANGLE_BOUNDS = (jnp.pi / 6, 5 * jnp.pi / 6)
+CONTACT_POINT_BOUNDS = (0.2, 0.8)
+ANGLE_BOUNDS = (jnp.pi*0.2, jnp.pi*0.8)
 
 
 def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
     """Host callback: raises ``ValueError`` if any env has non-finite or out-of-range values."""
     lo_cp, hi_cp = CONTACT_POINT_BOUNDS
     lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
-    cp = np.asarray(cp, dtype=np.float64).reshape(-1)
-    ang = np.asarray(ang, dtype=np.float64).reshape(-1)
+    cp = np.asarray(cp, dtype=np.float32).reshape(-1)
+    ang = np.asarray(ang, dtype=np.float32).reshape(-1)
     if cp.shape != ang.shape:
         raise ValueError(f"contact_point and angle length mismatch: {cp.shape} vs {ang.shape}")
     for name, arr, lo, hi in (
@@ -68,8 +67,6 @@ PUSHER_MAX_FORCE = 80.0
 # The approach phase moves the pusher from `pusher_start` to `pre_contact`
 # (`PUSHER_APPROACH_DISTANCE`) at `PUSHER_APPROACH_VELOCITY`; the push phase
 # then advances `DEFAULT_PUSH_DISTANCE` at `PUSHER_PUSH_VELOCITY`.  Any leftover
-# budget of `n_sim_steps` is a "hold" phase where the pusher target stays put
-# and the T-block coasts/settles under floor friction.
 PUSHER_APPROACH_VELOCITY = 4.0  # m/s
 PUSHER_PUSH_VELOCITY = 2.0  # m/s
 
@@ -78,6 +75,12 @@ PUSHER_PUSH_VELOCITY = 2.0  # m/s
 T_PUSHER_CONTACT_K = 2.0e4  # N/m  (~1 mm penetration at 20 N)
 T_PUSHER_CONTACT_D = 80.0  # N·s/m
 PUSHER_EFFECTIVE_RADIUS = PUSHER_RADIUS  # collision radius of the pusher
+
+# Spring-damper wall contacts: each of the 8 T corners is checked against the
+# 4 axis-aligned workspace walls.  For flat half-plane walls, corner checking
+# is equivalent to edge checking (deepest point on any segment is always an endpoint).
+T_WALL_CONTACT_K = 2.0e4  # N/m
+T_WALL_CONTACT_D = 80.0  # N·s/m
 
 # Explicit joint-space friction on the T<->floor interface. We disable JaxSim's
 # implicit terrain tangential friction (contact mu=0) and model the floor
@@ -114,12 +117,13 @@ T_CORNERS = np.array(
         [0.025, 0.075],  # p6
         [0.025, -0.125],  # p7
     ],
-    dtype=np.float64,
+    dtype=np.float32,
 )
 FACE_START_POINTS = T_CORNERS[[0, 2, 3, 4, 6, 7]]
 FACE_END_POINTS = T_CORNERS[[1, 3, 4, 5, 7, 0]]
 _FACE_START_POINTS_JAX = jnp.asarray(FACE_START_POINTS)
 _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
+_T_CORNERS_JAX = jnp.asarray(T_CORNERS)  # (8, 2) body-frame corners
 
 
 def _plan_push_jax(
@@ -281,6 +285,54 @@ def _t_floor_friction_single(
 _t_floor_friction_batched = jax.jit(jax.vmap(_t_floor_friction_single, in_axes=(0, 0)))
 
 
+def _t_wall_contact_forces_single(
+    t_xy: jnp.ndarray,
+    t_vel_xy: jnp.ndarray,
+    t_theta: jnp.ndarray,
+    t_omega: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Spring-damper penalty forces from T corners vs the 4 workspace walls.
+
+    Returns F_wall_world (2,), tau_wall.
+    """
+    c = jnp.cos(t_theta)
+    s = jnp.sin(t_theta)
+    R = jnp.array([[c, -s], [s, c]])  # body -> world
+    corners_world = t_xy[None, :] + (_T_CORNERS_JAX @ R.T)  # (8, 2)
+
+    r = corners_world - t_xy[None, :]  # (8, 2) moment arms in world frame
+    v_corners = t_vel_xy[None, :] + t_omega * jnp.stack([-r[:, 1], r[:, 0]], axis=-1)  # (8, 2)
+
+    # Penetration depths into each wall (zero when not in contact).
+    pen_left   = jnp.maximum(0.0, -corners_world[:, 0])                        # x < 0
+    pen_right  = jnp.maximum(0.0, corners_world[:, 0] - WORKSPACE_WIDTH)       # x > W
+    pen_bottom = jnp.maximum(0.0, -corners_world[:, 1])                        # y < 0
+    pen_top    = jnp.maximum(0.0, corners_world[:, 1] - WORKSPACE_HEIGHT)      # y > H
+
+    # Closing rates (positive = moving toward the wall).
+    cr_left   = jnp.maximum(0.0, -v_corners[:, 0])
+    cr_right  = jnp.maximum(0.0,  v_corners[:, 0])
+    cr_bottom = jnp.maximum(0.0, -v_corners[:, 1])
+    cr_top    = jnp.maximum(0.0,  v_corners[:, 1])
+
+    # Force magnitudes; damping only applies while in contact.
+    f_left   = jnp.where(pen_left   > 0.0, T_WALL_CONTACT_K * pen_left   + T_WALL_CONTACT_D * cr_left,   0.0)
+    f_right  = jnp.where(pen_right  > 0.0, T_WALL_CONTACT_K * pen_right  + T_WALL_CONTACT_D * cr_right,  0.0)
+    f_bottom = jnp.where(pen_bottom > 0.0, T_WALL_CONTACT_K * pen_bottom + T_WALL_CONTACT_D * cr_bottom, 0.0)
+    f_top    = jnp.where(pen_top    > 0.0, T_WALL_CONTACT_K * pen_top    + T_WALL_CONTACT_D * cr_top,    0.0)
+
+    # Net force per corner: left/bottom push +, right/top push -.
+    F_corners = jnp.stack([f_left - f_right, f_bottom - f_top], axis=-1)  # (8, 2)
+
+    # Torque per corner: r × F (2D cross product = rx*Fy - ry*Fx).
+    tau_corners = r[:, 0] * F_corners[:, 1] - r[:, 1] * F_corners[:, 0]  # (8,)
+
+    return F_corners.sum(axis=0), tau_corners.sum()
+
+
+_t_wall_contact_forces_batched = jax.jit(jax.vmap(_t_wall_contact_forces_single, in_axes=(0, 0, 0, 0)))
+
+
 # ── Action dataclass ──────────────────────────────────────────────────────────
 
 
@@ -340,16 +392,16 @@ class Action:
 
         if _is_concrete(self.face):
             f = np.asarray(self.face)
-            assert f.dtype in (np.int32, np.int64), f"face must be int32/int64, got {f.dtype}"
-            assert np.all((f >= 0) & (f <= 5)), "face must be in {0, …, 5}"
+            assert f.dtype == np.int32, f"face must be int32, got {f.dtype}"
+            assert np.all((f >= 0) & (f <= 5)), f"face must be in (0, 1, 2, 3, 4, 5), got {f}"
         if _is_concrete(self.contact_point):
             cp = np.asarray(self.contact_point)
-            assert cp.dtype in (np.float32, np.float64), f"contact_point must be float32/float64, got {cp.dtype}"
+            assert cp.dtype == np.float32, f"contact_point must be float32, got {cp.dtype}"
             lo, hi = CONTACT_POINT_BOUNDS
-            assert np.all((cp >= lo) & (cp <= hi)), f"contact_point must be in [{lo}, {hi}]"
+            assert np.all((cp >= lo) & (cp <= hi)), f"contact_point must be in [{lo}, {hi}], got {cp}"
         if _is_concrete(self.angle):
             a = np.asarray(self.angle)
-            assert a.dtype in (np.float32, np.float64), f"angle must be float32/float64, got {a.dtype}"
+            assert a.dtype == np.float32, f"angle must be float32, got {a.dtype}"
             lo, hi = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
             assert np.all((a >= lo) & (a <= hi)), f"angle must be in [{lo}, {hi}], got {a}"
 
@@ -409,8 +461,8 @@ def step_parallel(
     )
 
 
-def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int, int]:
-    """Split `n_sim_steps` between approach / push / hold phases.
+def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int]:
+    """Split `n_sim_steps` between approach / push phases.
 
     Returned values are concrete Python ints so they can be used as static
     shapes inside a jit'd function (needed for `jnp.linspace(..., num=N)`).
@@ -419,8 +471,7 @@ def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int, int]:
     push_full = max(1, int(round(DEFAULT_PUSH_DISTANCE / (PUSHER_PUSH_VELOCITY * dt))))
     approach_steps = min(approach_full, n_sim_steps)
     push_steps = min(push_full, n_sim_steps - approach_steps)
-    hold_steps = n_sim_steps - approach_steps - push_steps
-    return approach_steps, push_steps, hold_steps
+    return approach_steps, push_steps
 
 
 @functools.partial(
@@ -428,7 +479,6 @@ def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int, int]:
     static_argnames=(
         "approach_steps",
         "push_steps",
-        "hold_steps",
         "pusher_x_idx",
         "pusher_y_idx",
         "T_x_idx",
@@ -457,7 +507,6 @@ def _step_pure_impl(
     nenvs: int,
     approach_steps: int,
     push_steps: int,
-    hold_steps: int,
     check_t_displacement: bool = True,
 ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fully pure, jittable, differentiable physics rollout for one action.
@@ -475,8 +524,8 @@ def _step_pure_impl(
     dt = model.time_step
 
     # ── Planning (all jnp) ─────────────────────────────────────────────
-    contact_point = jnp.asarray(contact_point, dtype=jnp.float64)
-    angle = jnp.asarray(angle, dtype=jnp.float64)
+    contact_point = jnp.asarray(contact_point, dtype=jnp.float32)
+    angle = jnp.asarray(angle, dtype=jnp.float32)
     jax.debug.callback(_raise_unless_contact_angle_bounds, contact_point, angle)
     T_x = data.joint_positions[:, T_x_idx]
     T_y = data.joint_positions[:, T_y_idx]
@@ -509,14 +558,6 @@ def _step_pure_impl(
         pusher_start[:, None, :] + approach_scales[None, :, None] * (pre_contact - pusher_start)[:, None, :]
     )
     push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
-
-    if hold_steps > 0:
-        assert False, "is this running"
-        final_target = push_targets[:, -1:, :]  # (nenvs, 1, 2)
-        hold_targets = jnp.broadcast_to(final_target, (nenvs, hold_steps, 2))
-        pusher_targets = jnp.concatenate([approach_targets, push_targets, hold_targets], axis=1)
-    else:
-        pusher_targets = jnp.concatenate([approach_targets, push_targets], axis=1)
 
     workspace_margin = PUSHER_RADIUS
     lb = jnp.array([workspace_margin, workspace_margin])
@@ -557,13 +598,14 @@ def _step_pure_impl(
             cur_xy, cur_vel_xy, t_xy, t_vel_xy, t_theta, t_omega
         )
         F_fric_world, tau_fric = jax.vmap(_t_floor_friction_single)(t_vel_xy, t_omega)
+        F_wall_world, tau_wall = jax.vmap(_t_wall_contact_forces_single)(t_xy, t_vel_xy, t_theta, t_omega)
 
         joint_forces = jnp.zeros_like(data.joint_velocities)
         joint_forces = joint_forces.at[:, pusher_x_idx].set(pusher_forces[:, 0] + F_pusher_world[:, 0])
         joint_forces = joint_forces.at[:, pusher_y_idx].set(pusher_forces[:, 1] + F_pusher_world[:, 1])
-        joint_forces = joint_forces.at[:, T_x_idx].set(F_t_world[:, 0] + F_fric_world[:, 0])
-        joint_forces = joint_forces.at[:, T_y_idx].set(F_t_world[:, 1] + F_fric_world[:, 1])
-        joint_forces = joint_forces.at[:, T_theta_idx].set(tau_t + tau_fric)
+        joint_forces = joint_forces.at[:, T_x_idx].set(F_t_world[:, 0] + F_fric_world[:, 0] + F_wall_world[:, 0])
+        joint_forces = joint_forces.at[:, T_y_idx].set(F_t_world[:, 1] + F_fric_world[:, 1] + F_wall_world[:, 1])
+        joint_forces = joint_forces.at[:, T_theta_idx].set(tau_t + tau_fric + tau_wall)
 
         data = step_parallel(model, data, joint_forces)
         mask = static_joint_mask[None, :]
@@ -627,11 +669,11 @@ class PushTEnv:
         self._visualize = visualize
         self._visualizer = None
         self._viewer = None
-        self._t_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
-        self._target_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float64)
+        self._t_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float32)
+        self._target_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float32)
         self._frames: list = []
 
-        rod_sdf = rod.Sdf.load(pathlib.Path("assets/scene.sdf"))
+        rod_sdf = rod.Sdf.load(Path("assets/scene.sdf"))
         for model in rod_sdf.models():
             model.switch_frame_convention(frame_convention=rod.FrameConvention.Urdf, explicit_frames=True)
         model_sdf_string = rod_sdf.serialize(pretty=True)
@@ -873,7 +915,7 @@ class PushTEnv:
 
         # First, set randomized poses for the T and target T
         if target_poses is None:
-            self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
+            self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
             self._target_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
             self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
             self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
@@ -885,7 +927,7 @@ class PushTEnv:
 
         #
         if t_poses is None:
-            self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float64)
+            self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
             self._t_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
             self._t_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
             self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
@@ -1027,13 +1069,13 @@ class PushTEnv:
         :meth:`reset` without threading extra ``env`` arrays.
         """
         assert n_sim_steps > 0, "n_sim_steps must be > 0"
-        approach_steps, push_steps, hold_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
+        approach_steps, push_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
         return _step_pure_impl(
             self._model,
             data,
             jnp.asarray(face).astype(jnp.int32),
-            jnp.asarray(contact_point).astype(jnp.float64),
-            jnp.asarray(angle).astype(jnp.float64),
+            jnp.asarray(contact_point).astype(jnp.float32),
+            jnp.asarray(angle).astype(jnp.float32),
             self._static_joint_mask,
             self._pusher_x_idx,
             self._pusher_y_idx,
@@ -1045,7 +1087,6 @@ class PushTEnv:
             self._nenvs,
             approach_steps,
             push_steps,
-            hold_steps,
             check_t_displacement,
         )
 
@@ -1078,13 +1119,13 @@ class PushTEnv:
             f"face_weights must be ({self._nenvs}, 6), got {face_weights.shape}"
         )
 
-        approach_steps, push_steps, hold_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
+        approach_steps, push_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
         return _step_pure_impl(
             self._model,
             data,
-            jnp.asarray(face_weights).astype(jnp.float64),
-            jnp.asarray(contact_point).astype(jnp.float64),
-            jnp.asarray(angle).astype(jnp.float64),
+            jnp.asarray(face_weights).astype(jnp.float32),
+            jnp.asarray(contact_point).astype(jnp.float32),
+            jnp.asarray(angle).astype(jnp.float32),
             self._static_joint_mask,
             self._pusher_x_idx,
             self._pusher_y_idx,
@@ -1096,7 +1137,6 @@ class PushTEnv:
             self._nenvs,
             approach_steps,
             push_steps,
-            hold_steps,
             check_t_displacement,
         )
 
@@ -1116,8 +1156,8 @@ class PushTEnv:
         # Extract (nenvs,)-shaped arrays from the Action, tolerating both
         # np.ndarray and jax.Array inputs.
         face = jnp.asarray(np.asarray(action.face)[:, 0]).astype(jnp.int32)
-        contact_point = jnp.asarray(np.asarray(action.contact_point)[:, 0]).astype(jnp.float64)
-        angle = jnp.asarray(np.asarray(action.angle)[:, 0]).astype(jnp.float64)
+        contact_point = jnp.asarray(np.asarray(action.contact_point)[:, 0]).astype(jnp.float32)
+        angle = jnp.asarray(np.asarray(action.angle)[:, 0]).astype(jnp.float32)
 
         self._data, t_poses, t_distances, jpos_traj = self.step_pure(
             data=self._data,
@@ -1129,7 +1169,7 @@ class PushTEnv:
         )
         self._t_poses = np.asarray(t_poses[:, -1, :])
 
-        # ── Post-hoc replay into viz / recorder ────────────────────────
+        # ── Post-hoc replay into viz / recorder ─────────────────────────
         if self._visualizer is not None or self._record_video:
             # Bring the trajectory to host once; cheap for the shapes we use.
             jpos_traj_np = np.asarray(jpos_traj)  # (nenvs, n_sim_steps, dofs)
@@ -1172,7 +1212,7 @@ class PushTEnv:
     def save_video_from_jpos_traj(self, filename: str, jpos_traj: np.ndarray) -> None:
         """Write a video to filename from a given joint position trajectory."""
         assert self._record_video, "record_video must be True to save video"
-        assert isinstance(filename, str), f"filename must be a string, got {type(filename)}"
+        assert isinstance(filename, (str, Path)), f"filename must be a string or Path, got {type(filename)}"
         assert isinstance(jpos_traj, (np.ndarray, jax.Array)), (
             f"jpos_traj must be a numpy array or jax array, got {type(jpos_traj)}"
         )

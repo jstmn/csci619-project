@@ -26,7 +26,6 @@ import numpy as np
 
 from pusht619.core import Action, PushTEnv
 
-jax.config.update("jax_enable_x64", True)
 
 N_ENVS = 16  # samples per batch (one env.step produces N_ENVS samples)
 N_BATCHES = 4  # total samples = N_ENVS * N_BATCHES
@@ -48,8 +47,8 @@ def main():
         goal = env.target_poses.copy()
 
         face = rng.integers(0, 6, size=(N_ENVS, 1)).astype(np.int32)
-        contact = rng.uniform(0.0, 1.0, size=(N_ENVS, 1)).astype(np.float64)
-        angle = rng.uniform(0.0, np.pi, size=(N_ENVS, 1)).astype(np.float64)
+        contact = rng.uniform(0.0, 1.0, size=(N_ENVS, 1)).astype(np.float32)
+        angle = rng.uniform(0.0, np.pi, size=(N_ENVS, 1)).astype(np.float32)
 
         result = env.step(
             Action(face=face, contact_point=contact, angle=angle),

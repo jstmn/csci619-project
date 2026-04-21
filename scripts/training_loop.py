@@ -42,8 +42,6 @@ from gurobipy import GRB
 
 from pusht619.core import Action, PushTEnv
 
-jax.config.update("jax_enable_x64", True)
-
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 N_ENVS = 64
@@ -116,12 +114,12 @@ class _PersistentFaceSolver:
         # uniform cost so Gurobi still returns *something*. We also surface
         # this upstream so the training loop can skip the step.
         if not np.all(np.isfinite(c_face)):
-            c_face = np.zeros(N_FACES, dtype=np.float64)
+            c_face = np.zeros(N_FACES, dtype=np.float32)
         for i in range(N_FACES):
             self.x[i].Obj = float(c_face[i])
         self.model.update()
         self.model.optimize()
-        return np.array([self.x[i].X for i in range(N_FACES)], dtype=np.float64)
+        return np.array([self.x[i].X for i in range(N_FACES)], dtype=np.float32)
 
 
 _SOLVER = _PersistentFaceSolver()
@@ -134,7 +132,7 @@ def gurobi_solve_batch(c_face_batch: np.ndarray) -> np.ndarray:
     prevents a single poisoned env from killing the whole training run.
     """
     N = c_face_batch.shape[0]
-    out = np.zeros((N, N_FACES), dtype=np.float64)
+    out = np.zeros((N, N_FACES), dtype=np.float32)
     for i in range(N):
         out[i] = _SOLVER.solve(c_face_batch[i])
     return out

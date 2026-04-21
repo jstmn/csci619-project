@@ -5,7 +5,6 @@ import pytest
 import jaxsim as js
 import jax.numpy as jnp
 import jax
-# jax.config.update("jax_disable_jit", True)
 
 from pusht619.core import Action, PushTEnv
 
@@ -48,8 +47,8 @@ def test_step_executes_push_action() -> None:
 
     action = Action(
         face=np.array([[2]], dtype=np.int32),
-        contact_point=np.array([[0.5]], dtype=np.float64),
-        angle=np.array([[np.pi / 2]], dtype=np.float64),
+        contact_point=np.array([[0.5]], dtype=np.float32),
+        angle=np.array([[np.pi / 2]], dtype=np.float32),
     )
     env.step(action, n_sim_steps=100)
 
@@ -89,8 +88,8 @@ def test_step_pure_is_differentiable() -> None:
         # Scalar: sum of final-step distances across envs.
         return t_distances[:, -1].sum()
 
-    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float64)
-    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float64)
+    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float32)
+    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float32)
 
     # Forward pass is a scalar cost.
     loss = cost(contact_point, angle)
@@ -142,8 +141,8 @@ def test_step_pure_soft_matches_hard() -> None:
 
     # Cover all 6 faces + 3 repeats.
     face_int = jnp.array([0, 1, 2, 3, 4, 5, 0, 2, 4], dtype=jnp.int32)
-    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float64)
-    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float64)
+    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float32)
+    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float32)
 
     _, t_poses_hard, t_dists_hard, _ = env.step_pure(
         data=data0,
@@ -153,7 +152,7 @@ def test_step_pure_soft_matches_hard() -> None:
         n_sim_steps=n_sim_steps,
     )
 
-    face_weights = jax.nn.one_hot(face_int, num_classes=6, dtype=jnp.float64)
+    face_weights = jax.nn.one_hot(face_int, num_classes=6, dtype=jnp.float32)
     _, t_poses_soft, t_dists_soft, _ = env.step_pure_soft(
         data=data0,
         face_weights=face_weights,
@@ -177,12 +176,12 @@ def test_step_pure_soft_is_differentiable_in_face() -> None:
     env.reset(seed=0)
     data0 = env.data
 
-    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float64)
-    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float64)
+    contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float32)
+    angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float32)
     # Bias each env toward a different face so the softmaxed weights are sharp
     # enough to put the pusher on an actual edge (uniform weights would land
     # the contact point inside the T block and blow up physics).
-    face_logits = jnp.zeros((nenvs, 6), dtype=jnp.float64).at[jnp.arange(nenvs), jnp.array([0, 1, 2, 3])].set(5.0)
+    face_logits = jnp.zeros((nenvs, 6), dtype=jnp.float32).at[jnp.arange(nenvs), jnp.array([0, 1, 2, 3])].set(5.0)
 
     def cost(face_logits: jnp.ndarray) -> jnp.ndarray:
         face_weights = jax.nn.softmax(face_logits, axis=-1)
@@ -211,21 +210,20 @@ def test_step_pure_soft_is_differentiable_in_face() -> None:
 # python -m pytest tests/test_core.py::test_t_pose_unchanged --capture=no
 def test_t_pose_unchanged():
     """Debug a specific test"""
-    jax.config.update("jax_enable_x64", True)
     env = PushTEnv(nenvs=1, record_video=True, visualize=False)
-    env.reset(seed=0, t_poses=np.array([[0.44149, 1.34959, 0.76838]], dtype=np.float64))
+    env.reset(seed=0, t_poses=np.array([[0.44149, 1.34959, 0.76838]], dtype=np.float32))
 
     data: js.data.JaxSimModelData = env.data
     # step_pure / _plan_push_jax expect per-env scalars shaped (nenvs,), not (nenvs, 1);
     # column vectors make contact_point[:, None] rank-3 and break the rotation einsum.
     faces = np.array([0], dtype=np.int32).reshape(-1)
-    contact_point = np.array([0.7272050578501773], dtype=np.float64).reshape(-1)
-    angle = np.array([0.6204681562681296], dtype=np.float64).reshape(-1)
+    contact_point = np.array([0.7272050578501773], dtype=np.float32).reshape(-1)
+    angle = np.array([0.6204681562681296], dtype=np.float32).reshape(-1)
     _, _, t_dists, jpos_traj = env.step_pure(
         data=data,
         face=jnp.asarray(faces, dtype=jnp.int32).reshape(-1),
-        contact_point=jnp.asarray(contact_point, dtype=jnp.float64).reshape(-1),
-        angle=jnp.asarray(angle, dtype=jnp.float64).reshape(-1),
+        contact_point=jnp.asarray(contact_point, dtype=jnp.float32).reshape(-1),
+        angle=jnp.asarray(angle, dtype=jnp.float32).reshape(-1),
         n_sim_steps=100,
     )
     print(t_dists)
