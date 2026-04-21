@@ -46,8 +46,8 @@ System design (SurCo-prior):
    Gradient via Berthet et al. 2020 randomized smoothing through the MILP.
 3. Rollout via step_pure_soft (differentiable physics; one-hot face is valid input).
 4. Loss: run one rollout using the clean MILP solution x* = argmin c^T x.
-5. Backprop through the rollout, then use randomized smoothing only in the MILP VJP
-   to estimate gradients through the combinatorial solve before propagating to the NN.
+5. Backprop through the rollout, then use randomized smoothing only in the MILP
+   VJP to estimate gradients through the combinatorial solve before the NN.
 
 
 Run:
@@ -166,16 +166,6 @@ def _solve_milp_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
     )
 
 
-def _assert_faces_match(face_star: np.ndarray, face_k: np.ndarray, k_i: np.ndarray) -> None:
-    face_star = np.asarray(face_star)
-    face_k = np.asarray(face_k)
-    if not np.array_equal(face_star, face_k):
-        raise AssertionError(
-            f"Randomized smoothing switched face at k={int(np.asarray(k_i))}: "
-            f"clean={face_star.tolist()} perturbed={face_k.tolist()}"
-        )
-
-
 @jax.custom_vjp
 def milp_solver(c: jnp.ndarray, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray:
     """Differentiable Gurobi: c (N,8) → x_star (N,8).
@@ -189,9 +179,9 @@ def milp_solver(c: jnp.ndarray, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray
 
 
 def _milp_forward(c, rng, verbosity):
-    # Primal/forward evaluation uses the clean cost c. The K noisy solves for
-    # randomized smoothing are deferred to _milp_backward and only happen when
-    # value_and_grad backpropagates through this custom VJP.
+    # Primal evaluation solves the MILP at the branch cost c supplied by cost().
+    # The K noisy solves used for the randomized-smoothing VJP are deferred to
+    # _milp_backward and only happen during backpropagation.
     x_star = _solve_milp_pure_callback(c)
     rng, sample_rng = jax.random.split(rng)
     return x_star, (c, x_star, sample_rng, int(verbosity))
@@ -202,7 +192,6 @@ def _milp_backward(res, grad_x):
     grad_x_safe = jnp.where(jnp.isfinite(grad_x), grad_x, 0.0).astype(jnp.float32)
     grad_c = jnp.zeros_like(c)
     key = sample_rng
-    face_star = jnp.argmax(_x_star[:, :N_FACES], axis=-1)
     # Randomized-smoothing estimator for dL/dc: solve the perturbed MILP K times
     # at c + lambda * eps_j, then average their contributions to the VJP.
     if verbosity > 0:
@@ -218,7 +207,6 @@ def _milp_backward(res, grad_x):
             jax.debug.print("  {k_i}: c_pert={c_pert}", k_i=k_i, c_pert=c_pert)
         x_k = _solve_milp_pure_callback(c_pert)
         face_k = jnp.argmax(x_k[:, :N_FACES], axis=-1)
-        jax.debug.callback(_assert_faces_match, face_star, face_k, jnp.int32(k_i))
         if verbosity > 0:
             jax.debug.print(
                 "  {k_i}: perturbed action face={face} contact_point={cp} angle={a}",
@@ -299,8 +287,8 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
                 hi=ctx.max(),
             )
 
-        # This is one clean primal solve at c. The K perturbed solves happen later,
-        # inside milp_solver's custom backward pass when gradients are requested.
+        # Do one clean forward solve/rollout. The only smoothing Monte Carlo lives
+        # in milp_solver's custom VJP, where it estimates dL/dc.
         x_star = milp_solver(c, rng_solve, verbosity)  # (N_ENVS, 8)
         face_onehot = x_star[:, :N_FACES]
         contact_point = x_star[:, 6]
@@ -309,7 +297,10 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
         if verbosity > 0:
             face_idx = jnp.argmax(face_onehot, axis=-1)
             jax.debug.print(
-                "rollout action face={face} contact_point={cp} angle={a}", face=face_idx, cp=contact_point, a=angle
+                "rollout action face={face} contact_point={cp} angle={a}",
+                face=face_idx,
+                cp=contact_point,
+                a=angle,
             )
 
         # _, _, t_distances, jpos_traj = env.step_pure_soft(
