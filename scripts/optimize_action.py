@@ -18,7 +18,7 @@ TODOS:
 
 unset LD_LIBRARY_PATH
 python scripts/optimize_action.py --random-side --random-t-pose --record-video --verbosity 1
-python scripts/optimize_action.py --record-video --verbosity 1
+python scripts/optimize_action.py --verbosity 1 --record-video
 """
 
 from __future__ import annotations
@@ -33,13 +33,12 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 from termcolor import cprint
 import jax
+jax.config.update("jax_compilation_cache_dir", str(Path.home() / ".cache/jax_pusht619"))
 import jax.numpy as jnp
 import numpy as np
 import argparse
 
 from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
-
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 
 
 class MLP:
@@ -88,10 +87,9 @@ RESET_SEED = 0
 def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: int):
     env = PushTEnv(nenvs=N_ENVS, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
-    if record_video:
-        now = datetime.now().strftime("%d__%H:%M:%S")
-        video_dir = Path(f"videos/{now}")
-        video_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().strftime("%d__%H:%M:%S")
+    save_dir = Path(f"videos/{now}")
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     # Context vector (dim=11): T_target_pose(3) | T_pose(3) | T_velocity(3) | pusher_xy(2)
     mlp = MLP(context_dim=11, output_ranges=[CONTACT_POINT_BOUNDS, ANGLE_BOUNDS])
@@ -196,7 +194,7 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
 
         # Save videos
         if record_video:
-            save_filepath = video_dir / f"{it:03d}.mp4"
+            save_filepath = save_dir / f"{it:03d}.mp4"
             env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
             if verbosity > 1:
                 print(f"  saved {save_filepath}")
@@ -274,7 +272,7 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
         ax4.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    save_filepath = video_dir / "optimization.png"
+    save_filepath = save_dir / "optimization.png"
     plt.savefig(save_filepath, bbox_inches="tight")
     print(f"Saved plot to {save_filepath}")
     print(f"xdg-open {save_filepath}")
