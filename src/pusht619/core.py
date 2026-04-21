@@ -810,11 +810,13 @@ class PushTEnv:
         self._update_multi_env_data(base_position, base_orientation, joint_positions)
         self._visualizer.sync(self._viewer)
 
-    def reset(self, seed: int = 0) -> np.ndarray:
+    def reset(self, seed: int | None = None) -> np.ndarray:
         """
         Reset all environments to random orientations at the origin.
         Returns poses (nenvs, 3).
         """
+        if seed is None:
+            seed = np.random.randint(0, 2**31 - 1)
         rng = np.random.default_rng(seed)
 
         # First, set randomized poses for the T and target T

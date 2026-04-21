@@ -17,6 +17,8 @@ TODOS:
 # Run it:
 
 unset LD_LIBRARY_PATH; python scripts/optimize_action.py
+
+python scripts/optimize_action.py --random-side --random-t-pose
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from termcolor import cprint
 import jax
 import jax.numpy as jnp
 import numpy as np
+import argparse
 
 from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
@@ -73,28 +76,28 @@ class MLP:
         return x
 
 
-N_OPT_STEPS = 10
-LR = 0.75  # for u_contact / u_angle (smooth)
-N_ENVS = 100
+N_OPT_STEPS = 25
+LR = 0.75
+N_ENVS = 49
 N_SIM_STEPS = 100
 RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for variety.
 VERBOSE = False
 
 
-def main():
-    env = PushTEnv(nenvs=N_ENVS, record_video=True, visualize=False)
+def main(random_side: bool, random_t_pose: bool, record_video: bool):
+    env = PushTEnv(nenvs=N_ENVS, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%H:%M:%S")
-    video_dir = Path(f"videos/")
-    video_dir.mkdir(parents=True, exist_ok=True)
+    if record_video:
+        video_dir = Path(f"videos/")
+        video_dir.mkdir(parents=True, exist_ok=True)
 
     # Context vector (dim=11): T_target_pose(3) | T_pose(3) | T_velocity(3) | pusher_xy(2)
     mlp = MLP(context_dim=11, output_ranges=[CONTACT_POINT_BOUNDS, ANGLE_BOUNDS])
     params = mlp.init(jax.random.PRNGKey(0))
-    rng = np.random.default_rng(seed=1)
-    faces = jnp.asarray(rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32))
+    rng = np.random.default_rng(seed=RESET_SEED)
 
-    def cost(params, data):
+    def cost(params, data, faces):
         ctx = env.get_context_vector(data)
         out = mlp.apply(params, ctx)  # (N_ENVS, 2)
         contact_point, angle = out[:, 0], out[:, 1]
@@ -130,13 +133,21 @@ def main():
     mins = []
     initial_mean_dist = None
     t_start = time.time()
+    faces = rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32)
+
     for it in range(N_OPT_STEPS):
-        env.reset(seed=RESET_SEED)
+        if random_side:
+            faces = rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32)
+
+        if random_t_pose:
+            env.reset()
+        else:
+            env.reset(seed=RESET_SEED)
 
         t0 = time.time()
         t_poses_0 = env.t_poses
         env_data_0 = env.data
-        (loss, (t_distances, jpos_traj, contact_point, angle)), g_params = cost_and_grad(params, env_data_0)
+        (loss, (t_distances, jpos_traj, contact_point, angle)), g_params = cost_and_grad(params, env_data_0, faces)
         params = jax.tree.map(lambda p, g: p - LR * g, params, g_params)
         dt = time.time() - t0
         if initial_mean_dist is None:
@@ -166,10 +177,11 @@ def main():
         mins.append(t_distances[:, -1].min())
 
         # Save videos
-        save_filepath = video_dir / f"{now}__learned_action_{it:03d}.mp4"
-        env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
-        if VERBOSE:
-            print(f"  saved {save_filepath}")
+        if record_video:
+            save_filepath = video_dir / f"{now}__learned_action_{it:03d}.mp4"
+            env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
+            if VERBOSE:
+                print(f"  saved {save_filepath}")
 
         # On NaN: save debug JSON + per-failing-env video
         final_dists = np.asarray(t_distances[:, -1])
@@ -191,14 +203,14 @@ def main():
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    fig.suptitle(f"Optimization Results - N_ENVS={N_ENVS}, N_SIM_STEPS={N_SIM_STEPS}, N_OPT_STEPS={N_OPT_STEPS}")
+    fig.suptitle(
+        f"Optimization Results - N_ENVS={N_ENVS}, N_SIM_STEPS={N_SIM_STEPS}, N_OPT_STEPS={N_OPT_STEPS}, RANDOM_SIDE={random_side}, RANDOM_T_POSE={random_t_pose}"
+    )
     # Left plot: mean with min and max
     ax1.axhline(initial_mean_dist, label="initial mean", color="black")
     ax1.plot(means, label="mean")
-    # ax1.plot(mins, label="min")
-    # ax1.plot(maxs, label="max")
     ax1.legend()
-    ax1.set_title("Mean Distance with Min/Max")
+    ax1.set_title("Mean Distance")
     ax1.set_xlabel("Iteration")
     ax1.set_ylabel("Distance [m]")
     ax1.grid(True, alpha=0.3)
@@ -216,4 +228,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--random-side", action="store_true", help="Randomize the side of the target object")
+    parser.add_argument("--random-t-pose", action="store_true", help="Randomize the target pose")
+    parser.add_argument("--record-video", action="store_true", help="Record a video of the optimization process")
+    args = parser.parse_args()
+    main(random_side=args.random_side, random_t_pose=args.random_t_pose, record_video=args.record_video)

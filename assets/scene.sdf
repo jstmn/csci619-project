@@ -390,8 +390,8 @@
           </cylinder>
         </geometry>
         <material>
-          <ambient>0.20 0.40 0.80 1.0</ambient>
-          <diffuse>0.20 0.40 0.80 1.0</diffuse>
+          <ambient>0.90 0.90 0.80 1.0</ambient>
+          <diffuse>0.90 0.90 1.00 1.0</diffuse>
         </material>
       </visual>
     </link>
