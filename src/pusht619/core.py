@@ -421,6 +421,8 @@ def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int, int]:
         "T_x_idx",
         "T_y_idx",
         "T_theta_idx",
+        "T_target_x_idx",
+        "T_target_y_idx",
         "nenvs",
         "check_t_displacement",
     ),
@@ -431,18 +433,14 @@ def _step_pure_impl(
     face: jnp.ndarray,  # (nenvs,) int
     contact_point: jnp.ndarray,  # (nenvs,)  must satisfy CONTACT_POINT_BOUNDS (checked below)
     angle: jnp.ndarray,  # (nenvs,)  must satisfy ANGLE_BOUNDS (checked below)
-    target_xy: jnp.ndarray,  # (nenvs, 2) float  —  used only to compute t_distances
-    pinned_base_position: jnp.ndarray,  # (nenvs, 3)
-    pinned_base_quaternion: jnp.ndarray,  # (nenvs, 4)
-    pinned_base_linear_velocity: jnp.ndarray,  # (nenvs, 3)
-    pinned_base_angular_velocity: jnp.ndarray,  # (nenvs, 3)
-    pinned_joint_positions: jnp.ndarray,  # (nenvs, dofs) — only the "static" columns matter
     static_joint_mask: jnp.ndarray,  # (dofs,) bool
     pusher_x_idx: int,
     pusher_y_idx: int,
     T_x_idx: int,
     T_y_idx: int,
     T_theta_idx: int,
+    T_target_x_idx: int,
+    T_target_y_idx: int,
     nenvs: int,
     approach_steps: int,
     push_steps: int,
@@ -455,7 +453,8 @@ def _step_pure_impl(
     -------
     data_new : `JaxSimModelData` at the end of the rollout.
     t_poses  : (nenvs, n_sim_steps, 3) the T pose at every sim step.
-    t_dists  : (nenvs, n_sim_steps) Euclidean xy distance from T to `target_xy`.
+    t_dists  : (nenvs, n_sim_steps) Euclidean xy distance from T to the goal
+               (``t_target`` joint xy from ``data`` after pusher placement).
     jpos_traj: (nenvs, n_sim_steps, dofs) full joint position trace — useful
                only for replay into the visualizer / recorder; do NOT touch
                this when computing gradients (it's large and mostly redundant).
@@ -479,6 +478,16 @@ def _step_pure_impl(
     jv = jv.at[:, pusher_y_idx].set(0.0)
     data = data.replace(model=model, joint_positions=jp, joint_velocities=jv)
 
+    # Pin reference + goal xy from this rollout's initial state (not from
+    # ``env`` attributes) so :func:`jax.jit` costs see them as tracers when
+    # ``data`` changes after :meth:`PushTEnv.reset`.
+    pin_jp = data.joint_positions
+    pin_bp = data.base_position
+    pin_bq = data.base_quaternion
+    pin_blv = data._base_linear_velocity
+    pin_bav = data._base_angular_velocity
+    target_xy = jnp.stack([pin_jp[:, T_target_x_idx], pin_jp[:, T_target_y_idx]], axis=-1)
+
     # ── Build pusher target trajectory ─────────────────────────────────
     approach_scales = jnp.linspace(0.0, 1.0, num=approach_steps)
     push_scales = jnp.linspace(0.0, DEFAULT_PUSH_DISTANCE, num=push_steps)
@@ -489,6 +498,7 @@ def _step_pure_impl(
     push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
 
     if hold_steps > 0:
+        assert False, "is this running"
         final_target = push_targets[:, -1:, :]  # (nenvs, 1, 2)
         hold_targets = jnp.broadcast_to(final_target, (nenvs, hold_steps, 2))
         pusher_targets = jnp.concatenate([approach_targets, push_targets, hold_targets], axis=1)
@@ -544,14 +554,14 @@ def _step_pure_impl(
 
         data = step_parallel(model, data, joint_forces)
         mask = static_joint_mask[None, :]
-        jp_pinned = jnp.where(mask, pinned_joint_positions, data.joint_positions)
+        jp_pinned = jnp.where(mask, pin_jp, data.joint_positions)
         jv_pinned = jnp.where(mask, 0.0, data.joint_velocities)
         data = data.replace(
             model=model,
-            base_position=pinned_base_position,
-            base_quaternion=pinned_base_quaternion,
-            base_linear_velocity=pinned_base_linear_velocity,
-            base_angular_velocity=pinned_base_angular_velocity,
+            base_position=pin_bp,
+            base_quaternion=pin_bq,
+            base_linear_velocity=pin_blv,
+            base_angular_velocity=pin_bav,
             joint_positions=jp_pinned,
             joint_velocities=jv_pinned,
         )
@@ -733,6 +743,39 @@ class PushTEnv:
                 height=1280,
             )
 
+
+    @property
+    def nenvs(self) -> int:
+        return self._nenvs
+
+    @property
+    def t_poses(self) -> np.ndarray:
+        """Current poses (nenvs, 3) — read-only copy."""
+        return self._t_poses.copy()
+
+    @property
+    def target_poses(self) -> np.ndarray:
+        """Target poses (nenvs, 3) — read-only copy."""
+        return self._target_poses.copy()
+
+    @property
+    def t_target_poses(self) -> np.ndarray:
+        """Target pose (3) — read-only copy."""
+        return self._target_poses.copy()
+
+    @property
+    def data(self) -> js.data.JaxSimModelData:
+        """Current `JaxSimModelData` — pass this to :py:meth:`step_pure` when
+        you want to differentiate through a rollout starting from the current
+        simulation state.
+        """
+        return self._data
+
+    @property
+    def model(self) -> js.model.JaxSimModel:
+        return self._model
+
+
     def get_context_vector(self, data) -> jnp.ndarray:
         return jnp.concatenate(
             [
@@ -767,9 +810,6 @@ class PushTEnv:
             axis=-1,
         )
 
-    @property
-    def nenvs(self) -> int:
-        return self._nenvs
 
     def _sync_visualizer(self) -> None:
         if self._visualizer is None:
@@ -915,11 +955,10 @@ class PushTEnv:
     #     env = PushTEnv(nenvs=N)
     #     env.reset()
     #     data0 = env.data                      # snapshot the initial JaxSim state
-    #     target_xy = env.target_poses[:, :2]
     #
     #     def cost(contact_point, angle, face):
     #         _, _, t_dists, _ = env.step_pure(
-    #             data0, face, contact_point, angle, target_xy, n_sim_steps=100
+    #             data0, face, contact_point, angle, n_sim_steps=100
     #         )
     #         # Cost = distance-to-target at the final sim step, summed over envs
     #         return t_dists[:, -1].sum()
@@ -959,9 +998,12 @@ class PushTEnv:
         ``contact_point`` and ``angle`` must lie in :data:`CONTACT_POINT_BOUNDS` and
         :data:`ANGLE_BOUNDS` (same as :meth:`step` / :class:`Action`); otherwise the
         rollout raises ``ValueError``.
+
+        Goal xy and static-joint pins are read from ``data`` inside the rollout
+        (after pusher placement), so jitted costs stay correct across
+        :meth:`reset` without threading extra ``env`` arrays.
         """
         assert n_sim_steps > 0, "n_sim_steps must be > 0"
-        target_xy = jnp.asarray(self._target_poses[:, :2])
         approach_steps, push_steps, hold_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
         return _step_pure_impl(
             self._model,
@@ -969,18 +1011,14 @@ class PushTEnv:
             jnp.asarray(face).astype(jnp.int32),
             jnp.asarray(contact_point).astype(jnp.float64),
             jnp.asarray(angle).astype(jnp.float64),
-            jnp.asarray(target_xy).astype(jnp.float64),
-            self._pinned_base_position,
-            self._pinned_base_quaternion,
-            self._pinned_base_linear_velocity,
-            self._pinned_base_angular_velocity,
-            self._pinned_joint_positions,
             self._static_joint_mask,
             self._pusher_x_idx,
             self._pusher_y_idx,
             self._T_x_idx,
             self._T_y_idx,
             self._T_theta_idx,
+            self._T_target_x_idx,
+            self._T_target_y_idx,
             self._nenvs,
             approach_steps,
             push_steps,
@@ -994,7 +1032,6 @@ class PushTEnv:
         face_weights: jnp.ndarray,  # (nenvs, 6) float — per-face weights (e.g. softmax)
         contact_point: jnp.ndarray,  # (nenvs,) float
         angle: jnp.ndarray,  # (nenvs,) float
-        target_xy: jnp.ndarray | None = None,  # (nenvs, 2) float
         n_sim_steps: int = 100,
         *,
         check_t_displacement: bool = True,
@@ -1017,8 +1054,6 @@ class PushTEnv:
         assert face_weights.shape == (self._nenvs, 6), (
             f"face_weights must be ({self._nenvs}, 6), got {face_weights.shape}"
         )
-        if target_xy is None:
-            target_xy = jnp.asarray(self._target_poses[:, :2])
 
         approach_steps, push_steps, hold_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)
         return _step_pure_impl(
@@ -1027,18 +1062,14 @@ class PushTEnv:
             jnp.asarray(face_weights).astype(jnp.float64),
             jnp.asarray(contact_point).astype(jnp.float64),
             jnp.asarray(angle).astype(jnp.float64),
-            jnp.asarray(target_xy).astype(jnp.float64),
-            self._pinned_base_position,
-            self._pinned_base_quaternion,
-            self._pinned_base_linear_velocity,
-            self._pinned_base_angular_velocity,
-            self._pinned_joint_positions,
             self._static_joint_mask,
             self._pusher_x_idx,
             self._pusher_y_idx,
             self._T_x_idx,
             self._T_y_idx,
             self._T_theta_idx,
+            self._T_target_x_idx,
+            self._T_target_y_idx,
             self._nenvs,
             approach_steps,
             push_steps,
@@ -1107,28 +1138,6 @@ class PushTEnv:
             t_poses=np.asarray(t_poses),
             t_distances=np.asarray(t_distances),
         )
-
-    @property
-    def t_poses(self) -> np.ndarray:
-        """Current poses (nenvs, 3) — read-only copy."""
-        return self._t_poses.copy()
-
-    @property
-    def target_poses(self) -> np.ndarray:
-        """Target poses (nenvs, 3) — read-only copy."""
-        return self._target_poses.copy()
-
-    @property
-    def data(self) -> js.data.JaxSimModelData:
-        """Current `JaxSimModelData` — pass this to :py:meth:`step_pure` when
-        you want to differentiate through a rollout starting from the current
-        simulation state.
-        """
-        return self._data
-
-    @property
-    def model(self) -> js.model.JaxSimModel:
-        return self._model
 
     def save_video(self, filename: str) -> None:
         """Write a video to filename."""

@@ -231,7 +231,7 @@ def c_to_action(c: jnp.ndarray):
     return face_onehot, contact_point, angle
 
 
-def rollout_cost(c: jnp.ndarray, env: PushTEnv, data0, target_xy: jnp.ndarray):
+def rollout_cost(c: jnp.ndarray, env: PushTEnv, data0):
     """f(g_Ω(c); y) = mean final distance after the JAXSim rollout.
 
     No entropy reg: the face output is already one-hot, so entropy is
@@ -244,7 +244,6 @@ def rollout_cost(c: jnp.ndarray, env: PushTEnv, data0, target_xy: jnp.ndarray):
         face_weights=face_weights,
         contact_point=contact_point,
         angle=angle,
-        target_xy=target_xy,
         n_sim_steps=N_SIM_STEPS,
     )
     dist_sum = t_distances[:, -1].sum()
@@ -276,15 +275,15 @@ def make_train_step(cfg: TrainConfig):
     the update (skip on NaN)."""
     env = cfg.env
 
-    def loss_fn(params, y, data0, target_xy):
+    def loss_fn(params, y, data0):
         c = SurCoPrior().apply(params, y)
-        loss, dist_sum = rollout_cost(c, env, data0, target_xy)
+        loss, dist_sum = rollout_cost(c, env, data0)
         return loss, dist_sum
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
-    def step(state: train_state.TrainState, y, data0, target_xy):
-        (loss, dist_sum), grads = grad_fn(state.params, y, data0, target_xy)
+    def step(state: train_state.TrainState, y, data0):
+        (loss, dist_sum), grads = grad_fn(state.params, y, data0)
         return loss, dist_sum, grads
 
     return step
@@ -335,7 +334,7 @@ def train_prior():
         t0 = time.time()
         # Each step triggers 2 Gurobi batches: one on fwd, one on bwd with
         # perturbed costs. ~100 ms total for 64 envs × 2 solves.
-        loss, dist_sum, grads = step_fn(state, y, data0, target_xy)
+        loss, dist_sum, grads = step_fn(state, y, data0)
 
         # NaN check: if the rollout exploded, skip the update so we don't
         # poison the NN weights. The next batch gets a fresh seed and the
@@ -455,7 +454,7 @@ def hybrid_finetune(params, env: PushTEnv, seed: int = 9999, save_video: bool = 
 
     def cost(c_face, u_contact, u_angle):
         c = jnp.concatenate([c_face, u_contact[:, None], u_angle[:, None]], axis=-1)
-        loss, dist_sum = rollout_cost(c, env, data0, target_xy)
+        loss, dist_sum = rollout_cost(c, env, data0)
         return loss, dist_sum
 
     cost_and_grad = jax.value_and_grad(cost, argnums=(0, 1, 2), has_aux=True)

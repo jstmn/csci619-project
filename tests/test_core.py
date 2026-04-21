@@ -74,7 +74,6 @@ def test_step_pure_is_differentiable() -> None:
     env.reset(seed=0)
 
     data0 = env.data
-    target_xy = jnp.asarray(env.target_poses[:, :2])
 
     # Choose faces that point roughly toward the targets so the pusher actually
     # makes contact, ensuring a non-trivial gradient signal.
@@ -86,7 +85,6 @@ def test_step_pure_is_differentiable() -> None:
             face=face,
             contact_point=contact_point,
             angle=angle,
-            target_xy=target_xy,
             n_sim_steps=n_sim_steps,
         )
         # Scalar: sum of final-step distances across envs.
@@ -142,7 +140,6 @@ def test_step_pure_soft_matches_hard() -> None:
     env = PushTEnv(nenvs=nenvs, record_video=False, visualize=False)
     env.reset(seed=0)
     data0 = env.data
-    target_xy = jnp.asarray(env.target_poses[:, :2])
 
     # Cover all 6 faces + 3 repeats.
     face_int = jnp.array([0, 1, 2, 3, 4, 5, 0, 2, 4], dtype=jnp.int32)
@@ -154,7 +151,6 @@ def test_step_pure_soft_matches_hard() -> None:
         face=face_int,
         contact_point=contact_point,
         angle=angle,
-        target_xy=target_xy,
         n_sim_steps=n_sim_steps,
     )
 
@@ -164,7 +160,6 @@ def test_step_pure_soft_matches_hard() -> None:
         face_weights=face_weights,
         contact_point=contact_point,
         angle=angle,
-        target_xy=target_xy,
         n_sim_steps=n_sim_steps,
     )
 
@@ -182,7 +177,6 @@ def test_step_pure_soft_is_differentiable_in_face() -> None:
     env = PushTEnv(nenvs=nenvs, record_video=False, visualize=False)
     env.reset(seed=0)
     data0 = env.data
-    target_xy = jnp.asarray(env.target_poses[:, :2])
 
     contact_point = jnp.full((nenvs,), 0.5, dtype=jnp.float64)
     angle = jnp.full((nenvs,), np.pi / 2, dtype=jnp.float64)
@@ -198,7 +192,6 @@ def test_step_pure_soft_is_differentiable_in_face() -> None:
             face_weights=face_weights,
             contact_point=contact_point,
             angle=angle,
-            target_xy=target_xy,
             n_sim_steps=n_sim_steps,
         )
         return t_distances[:, -1].sum()

@@ -16,9 +16,8 @@ TODOS:
 
 # Run it:
 
-unset LD_LIBRARY_PATH; python scripts/optimize_action.py
-
-python scripts/optimize_action.py --random-side --random-t-pose
+unset LD_LIBRARY_PATH
+python scripts/optimize_action.py --random-side --random-t-pose --record-video
 """
 
 from __future__ import annotations
@@ -76,11 +75,11 @@ class MLP:
         return x
 
 
-N_OPT_STEPS = 25
-LR = 0.75
-N_ENVS = 49
+N_OPT_STEPS = 100
+LR = 0.5
+N_ENVS = 64
 N_SIM_STEPS = 100
-RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for variety.
+RESET_SEED = 0
 VERBOSE = False
 
 
