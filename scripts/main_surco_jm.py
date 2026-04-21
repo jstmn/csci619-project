@@ -45,10 +45,9 @@ System design (SurCo-prior):
        x[7] ∈ ANGLE_BOUNDS          (continuous)
    Gradient via Berthet et al. 2020 randomized smoothing through the MILP.
 3. Rollout via step_pure_soft (differentiable physics; one-hot face is valid input).
-4. Loss: average over K = RANDOMZED_SMOOTHING_K smoothed branches. Each branch samples
-   ε ~ N(0,I), sets c' = c + λ ε, solves x' = argmin c'^T x, and runs a full rollout from
-   the same post-reset initial state (fresh trajectory each branch).
-5. Backprop through each rollout + that branch's MILP VJP + NN.
+4. Loss: run one rollout using the clean MILP solution x* = argmin c^T x.
+5. Backprop through the rollout, then use randomized smoothing only in the MILP VJP
+   to estimate gradients through the combinatorial solve before propagating to the NN.
 
 
 Run:
@@ -81,13 +80,15 @@ from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-N_OPT_STEPS = 10
+VERBOSITY = 0
+N_OPT_STEPS = 50
 LR = 0.5
 N_ENVS = 9
 N_SIM_STEPS = 50
 RESET_SEED = 0
 N_FACES = 6
 RANDOMZED_SMOOTHING_K = 10
+OUTPUT_REG_BETA = 1e-3
 
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
@@ -154,7 +155,7 @@ def _gurobi_solve_batch(c_batch: np.ndarray) -> np.ndarray:
     return out
 
 
-def _solve_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
+def _solve_milp_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
     """Forward-only JAX wrapper around _gurobi_solve_batch. c: (N,8) → x: (N,8)."""
     c = c.astype(jnp.float32)
     shape = jax.ShapeDtypeStruct(c.shape, jnp.float32)
@@ -165,8 +166,18 @@ def _solve_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
     )
 
 
+def _assert_faces_match(face_star: np.ndarray, face_k: np.ndarray, k_i: np.ndarray) -> None:
+    face_star = np.asarray(face_star)
+    face_k = np.asarray(face_k)
+    if not np.array_equal(face_star, face_k):
+        raise AssertionError(
+            f"Randomized smoothing switched face at k={int(np.asarray(k_i))}: "
+            f"clean={face_star.tolist()} perturbed={face_k.tolist()}"
+        )
+
+
 @jax.custom_vjp
-def milp_solver(c: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
+def milp_solver(c: jnp.ndarray, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray:
     """Differentiable Gurobi: c (N,8) → x_star (N,8).
 
     Backward (Berthet et al. 2020): Monte Carlo over K_in = RANDOMZED_SMOOTHING_K draws
@@ -174,29 +185,52 @@ def milp_solver(c: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
         ∂L/∂c[n,i] ≈ (1/(K_in λ)) Σ_j ε_j[n,i] · (grad_x[n] · x_j[n])
     where grad_x is ∂L/∂x from the same forward branch's rollout (see cost()).
     """
-    return _solve_pure_callback(c)
+    return _solve_milp_pure_callback(c)
 
 
-def _milp_forward(c, rng):
-    x_star = _solve_pure_callback(c)
+def _milp_forward(c, rng, verbosity):
+    # Primal/forward evaluation uses the clean cost c. The K noisy solves for
+    # randomized smoothing are deferred to _milp_backward and only happen when
+    # value_and_grad backpropagates through this custom VJP.
+    x_star = _solve_milp_pure_callback(c)
     rng, sample_rng = jax.random.split(rng)
-    return x_star, (c, x_star, sample_rng)
+    return x_star, (c, x_star, sample_rng, int(verbosity))
 
 
 def _milp_backward(res, grad_x):
-    c, _x_star, sample_rng = res
+    c, _x_star, sample_rng, verbosity = res
     grad_x_safe = jnp.where(jnp.isfinite(grad_x), grad_x, 0.0).astype(jnp.float32)
     grad_c = jnp.zeros_like(c)
     key = sample_rng
-    for _ in range(RANDOMZED_SMOOTHING_K):
+    face_star = jnp.argmax(_x_star[:, :N_FACES], axis=-1)
+    # Randomized-smoothing estimator for dL/dc: solve the perturbed MILP K times
+    # at c + lambda * eps_j, then average their contributions to the VJP.
+    if verbosity > 0:
+        jax.debug.print("  c={c}", c=c)
+        jax.debug.print("\n")
+
+    #
+    for k_i in range(RANDOMZED_SMOOTHING_K):
         key, subkey = jax.random.split(key)
         eps = jax.random.normal(subkey, c.shape, dtype=jnp.float32)
         c_pert = (c + PERTURB_LAMBDA * eps).astype(jnp.float32)
-        x_k = _solve_pure_callback(c_pert)
+        if verbosity > 0:
+            jax.debug.print("  {k_i}: c_pert={c_pert}", k_i=k_i, c_pert=c_pert)
+        x_k = _solve_milp_pure_callback(c_pert)
+        face_k = jnp.argmax(x_k[:, :N_FACES], axis=-1)
+        jax.debug.callback(_assert_faces_match, face_star, face_k, jnp.int32(k_i))
+        if verbosity > 0:
+            jax.debug.print(
+                "  {k_i}: perturbed action face={face} contact_point={cp} angle={a}",
+                k_i=k_i,
+                face=face_k,
+                cp=x_k[:, 6],
+                a=x_k[:, 7],
+            )
         inner = jnp.sum(grad_x_safe * x_k, axis=-1, keepdims=True)  # (N, 1)
         grad_c = grad_c + eps * inner
     grad_c = grad_c / (RANDOMZED_SMOOTHING_K * PERTURB_LAMBDA)
-    return (grad_c, None)
+    return (grad_c, None, None)
 
 
 milp_solver.defvjp(_milp_forward, _milp_backward)
@@ -263,52 +297,44 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
                 n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max(),
             )
 
-        # K smoothed branches: each perturbed cost c_k, MILP action x_k, full rollout from
-        # the same initial `data` (pure physics; independent trajectory per branch).
-        key = rng_solve
-        loss_acc = jnp.float32(0.0)
-        t_distances_last = jpos_traj_last = None
-        face_onehot_last = cp_last = ang_last = None
-        for _ in range(RANDOMZED_SMOOTHING_K):
-            key, k_branch = jax.random.split(key)
-            k_eps, k_milp = jax.random.split(k_branch)
-            eps = jax.random.normal(k_eps, c.shape, dtype=jnp.float32)
-            c_k = (c + PERTURB_LAMBDA * eps).astype(jnp.float32)
-            x_k = milp_solver(c_k, k_milp)  # (N_ENVS, 8)
-            face_onehot = x_k[:, :N_FACES]
-            contact_point = x_k[:, 6]
-            angle = x_k[:, 7]
+        # This is one clean primal solve at c. The K perturbed solves happen later,
+        # inside milp_solver's custom backward pass when gradients are requested.
+        x_star = milp_solver(c, rng_solve, verbosity)  # (N_ENVS, 8)
+        face_onehot = x_star[:, :N_FACES]
+        contact_point = x_star[:, 6]
+        angle = x_star[:, 7]
 
-            if verbosity > 1:
-                jax.debug.print("contact_point: {cp}", cp=contact_point)
-                jax.debug.print("angle: {a}", a=angle)
+        if verbosity > 0:
+            face_idx = jnp.argmax(face_onehot, axis=-1)
+            jax.debug.print("rollout action face={face} contact_point={cp} angle={a}", face=face_idx, cp=contact_point, a=angle)
 
-            _, _, t_distances, jpos_traj = env.step_pure_soft(
-                data=data,
-                face_weights=face_onehot,
-                contact_point=contact_point,
-                angle=angle,
-                n_sim_steps=N_SIM_STEPS,
-                check_t_displacement=False,
-            )
+        # _, _, t_distances, jpos_traj = env.step_pure_soft(
+        _, _, t_distances, jpos_traj = env.step_pure(
+            data=data,
+            face=face_onehot,
+            contact_point=contact_point,
+            angle=angle,
+            n_sim_steps=N_SIM_STEPS,
+            check_t_displacement=False,
+        )
 
-            final_dists = t_distances[:, -1]
-            loss_acc = loss_acc + jnp.nanmean(final_dists)
-            t_distances_last = t_distances
-            jpos_traj_last = jpos_traj
-            face_onehot_last = face_onehot
-            cp_last = contact_point
-            ang_last = angle
-
-        loss = loss_acc / jnp.float32(RANDOMZED_SMOOTHING_K)
+        final_dists = t_distances[:, -1]
+        task_loss = jnp.nanmean(final_dists)
+        # The MILP is largely scale-invariant in c, so lightly penalize large
+        # surrogate costs to keep smoothing effective.
+        c_reg = OUTPUT_REG_BETA * jnp.mean(jnp.square(c))
+        loss = task_loss + c_reg
 
         if verbosity > 0:
             jax.debug.print(
-                "t_dist (last branch) sum(is_nan)={n} final_dists={d}",
-                n=jnp.sum(jnp.isnan(t_distances_last[:, -1])),
-                d=t_distances_last[:, -1],
+                "  sum(is_nan)={n} task_loss={task_loss:.6f} c_reg={c_reg:.6f}",
+                n=jnp.sum(jnp.isnan(t_distances[:, -1])),
+                task_loss=task_loss,
+                c_reg=c_reg,
             )
-        return loss, (t_distances_last, jpos_traj_last, face_onehot_last, cp_last, ang_last)
+        if verbosity > 1:
+            jax.debug.print("  final_dists={d}", d=t_distances[:, -1])
+        return loss, (t_distances, jpos_traj, face_onehot, contact_point, angle)
 
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
     # solve, so a JIT wrapper adds overhead without benefit. step_pure_soft is
@@ -428,7 +454,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     ax_std.set_ylabel("Std [m]")
     ax_std.grid(True, alpha=0.3)
 
-    for env_idx in range(N_ENVS):
+    for env_idx in range(min(N_ENVS, 3)):
         ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}")
         ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}")
         ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}")
@@ -475,4 +501,5 @@ if __name__ == "__main__":
     parser.add_argument("--random-t-pose", action="store_true", help="Randomize problem instances each iteration")
     parser.add_argument("--record-video", action="store_true")
     args = parser.parse_args()
+    VERBOSITY = args.verbosity
     main(args.problem_type, args.verbosity, args.random_t_pose, args.record_video)
