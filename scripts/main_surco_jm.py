@@ -12,14 +12,14 @@ Definitions, single-step problem:
         [6]:   contact_point in CONTACT_POINT_BOUNDS = (0.2, 0.8)
         [7]:   angle in ANGLE_BOUNDS = (0.2*pi, 0.8*pi)
 
-  - c: surrogate cost vector / Dim=8
-        [0:6]: face logits  (fed to Gurobi MILP; gradient via randomized smoothing)
-        [6]:   contact_point cost coefficient
-        [7]:   angle cost coefficient
+  - c: surrogate solver parameters / Dim=8
+        [0:6]: face logits  (fed to Gurobi; gradient via randomized smoothing)
+        [6]:   contact_point target in CONTACT_POINT_BOUNDS
+        [7]:   angle target in ANGLE_BOUNDS
 
   - omega: set of feasible solutions.
         x[0:6] must be one-hot, x[6] in CONTACT_POINT_BOUNDS, x[7] in ANGLE_BOUNDS.
-        All constraints enforced by the MILP.
+        All constraints enforced by the Gurobi solve.
 
   - f(x; y): objective function / Dim=1
         The cost is the sum squared distance of the corners of the target block
@@ -38,15 +38,20 @@ Surco methods:
 
 
 System design (SurCo-prior):
-1. NN: y → c  (8-dim surrogate cost vector)
-2. Combinatorial solver: Gurobi MILP  argmin c^T x  s.t.
+1. NN: y → c  (6 face logits + bounded targets for contact_point/angle)
+2. Combinatorial solver: Gurobi MIQP
+       argmin face_costs^T x_face
+            + w_cp (cp - cp_target)^2
+            + w_ang (ang - ang_target)^2
+       s.t.
        sum(x[0:6])=1, x[0:6]∈{0,1}^6
        x[6] ∈ CONTACT_POINT_BOUNDS  (continuous)
        x[7] ∈ ANGLE_BOUNDS          (continuous)
-   Gradient via Berthet et al. 2020 randomized smoothing through the MILP.
+   Gradient via Berthet et al. 2020 randomized smoothing through the solve.
 3. Rollout via step_pure_soft (differentiable physics; one-hot face is valid input).
-4. Loss: run one rollout using the clean MILP solution x* = argmin c^T x.
-5. Backprop through the rollout, then use randomized smoothing only in the MILP
+4. Loss: run one rollout using the clean Gurobi solution x* for the predicted
+   face logits and continuous targets.
+5. Backprop through the rollout, then use randomized smoothing only in the
    VJP to estimate gradients through the combinatorial solve before the NN.
 
 
@@ -82,24 +87,28 @@ from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
 VERBOSITY = 0
 N_OPT_STEPS = 50
-LR = 0.5
+LR = 0.1
 N_ENVS = 9
 N_SIM_STEPS = 50
 RESET_SEED = 0
 N_FACES = 6
 RANDOMZED_SMOOTHING_K = 10
 OUTPUT_REG_BETA = 1e-3
+CP_TARGET_WEIGHT = 1.0
+ANG_TARGET_WEIGHT = 1.0
 
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
 # Too large → x_k far from x*; gradient bias grows.
-PERTURB_LAMBDA = 0.5
+PERTURB_LAMBDA = 0.1
 
 
-# ── Gurobi MILP action solver ─────────────────────────────────────────────────
+# ── Gurobi action solver ──────────────────────────────────────────────────────
 
 _lo_cp, _hi_cp = CONTACT_POINT_BOUNDS
 _lo_ang, _hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
+_mid_cp = 0.5 * (_lo_cp + _hi_cp)
+_mid_ang = 0.5 * (_lo_ang + _hi_ang)
 
 
 class _PersistentActionSolver:
@@ -110,7 +119,7 @@ class _PersistentActionSolver:
         cp:     continuous contact_point in [lo_cp, hi_cp]
         ang:    continuous angle in [lo_ang, hi_ang]
 
-    Input c is (8,): [face_costs(6), cp_cost, ang_cost]
+    Input c is (8,): [face_costs(6), cp_target, ang_target]
     Output x is (8,): [face_onehot(6), cp, ang]
     """
 
@@ -128,13 +137,17 @@ class _PersistentActionSolver:
         self.model.update()
 
     def solve(self, c: np.ndarray) -> np.ndarray:
-        """Update objective coefficients from c (8,), solve, return x (8,)."""
+        """Update objective from c (8,), solve, return x (8,)."""
         if not np.all(np.isfinite(c)):
             c = np.zeros(8, dtype=np.float32)
-        for i in range(N_FACES):
-            self.xf[i].Obj = float(c[i])
-        self.cp.Obj = float(c[6])
-        self.ang.Obj = float(c[7])
+            c[6] = _mid_cp
+            c[7] = _mid_ang
+        cp_target = float(np.clip(c[6], _lo_cp, _hi_cp))
+        ang_target = float(np.clip(c[7], _lo_ang, _hi_ang))
+        face_obj = gp.quicksum(float(c[i]) * self.xf[i] for i in range(N_FACES))
+        cp_obj = CP_TARGET_WEIGHT * (self.cp - cp_target) * (self.cp - cp_target)
+        ang_obj = ANG_TARGET_WEIGHT * (self.ang - ang_target) * (self.ang - ang_target)
+        self.model.setObjective(face_obj + cp_obj + ang_obj, GRB.MINIMIZE)
         self.model.update()
         self.model.optimize()
         face_vals = np.array([self.xf[i].X for i in range(N_FACES)], dtype=np.float32)
@@ -147,7 +160,7 @@ _SOLVER = _PersistentActionSolver()
 
 
 def _gurobi_solve_batch(c_batch: np.ndarray) -> np.ndarray:
-    """Solve the MILP for every env. Returns (N, 8): [face_onehot(6), cp, ang]."""
+    """Solve the Gurobi objective for every env. Returns (N, 8)."""
     N = c_batch.shape[0]
     out = np.zeros((N, 8), dtype=np.float32)
     for i in range(N):
@@ -168,7 +181,7 @@ def _solve_milp_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
 
 @jax.custom_vjp
 def milp_solver(c: jnp.ndarray, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray:
-    """Differentiable Gurobi: c (N,8) → x_star (N,8).
+    """Differentiable Gurobi solve: c (N,8) → x_star (N,8).
 
     Backward (Berthet et al. 2020): Monte Carlo over K_in = RANDOMZED_SMOOTHING_K draws
         ε_j ~ N(0, I),  x_j = solve(c + λ ε_j)
@@ -179,7 +192,7 @@ def milp_solver(c: jnp.ndarray, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray
 
 
 def _milp_forward(c, rng, verbosity):
-    # Primal evaluation solves the MILP at the branch cost c supplied by cost().
+    # Primal evaluation solves the Gurobi objective at the branch parameters c.
     # The K noisy solves used for the randomized-smoothing VJP are deferred to
     # _milp_backward and only happen during backpropagation.
     x_star = _solve_milp_pure_callback(c)
@@ -192,7 +205,7 @@ def _milp_backward(res, grad_x):
     grad_x_safe = jnp.where(jnp.isfinite(grad_x), grad_x, 0.0).astype(jnp.float32)
     grad_c = jnp.zeros_like(c)
     key = sample_rng
-    # Randomized-smoothing estimator for dL/dc: solve the perturbed MILP K times
+    # Randomized-smoothing estimator for dL/dc: solve the perturbed objective K times
     # at c + lambda * eps_j, then average their contributions to the VJP.
     if verbosity > 0:
         jax.debug.print("  c={c}", c=c)
@@ -203,17 +216,16 @@ def _milp_backward(res, grad_x):
         key, subkey = jax.random.split(key)
         eps = jax.random.normal(subkey, c.shape, dtype=jnp.float32)
         c_pert = (c + PERTURB_LAMBDA * eps).astype(jnp.float32)
-        if verbosity > 0:
-            jax.debug.print("  {k_i}: c_pert={c_pert}", k_i=k_i, c_pert=c_pert)
         x_k = _solve_milp_pure_callback(c_pert)
         face_k = jnp.argmax(x_k[:, :N_FACES], axis=-1)
         if verbosity > 0:
+            jax.debug.print("\n  {k_i}", k_i=k_i)
+            jax.debug.print("       c_pert={c_pert}", c_pert=c_pert)
             jax.debug.print(
-                "  {k_i}: perturbed action face={face} contact_point={cp} angle={a}",
-                k_i=k_i,
+                "       x_perturbed face={face} contact_point={cp} angle={a}",
                 face=face_k,
                 cp=x_k[:, 6],
-                a=x_k[:, 7],
+                a=x_k[:, 7]
             )
         inner = jnp.sum(grad_x_safe * x_k, axis=-1, keepdims=True)  # (N, 1)
         grad_c = grad_c + eps * inner
@@ -228,11 +240,11 @@ milp_solver.defvjp(_milp_forward, _milp_backward)
 
 
 class MLP:
-    """Maps context y (dim=11) → surrogate cost c (dim=8).
+    """Maps context y (dim=11) → solver parameters c (dim=8).
 
-    c[:6] = face cost coefficients  (fed to Gurobi MILP; randomized-smoothing VJP)
-    c[6]  = contact_point cost coefficient
-    c[7]  = angle cost coefficient
+    c[:6] = face cost coefficients
+    c[6]  = contact_point target, squashed into CONTACT_POINT_BOUNDS
+    c[7]  = angle target, squashed into ANGLE_BOUNDS
 
     Params: list of (W, b) tuples — plain JAX pytree, jit/grad compatible.
     """
@@ -251,12 +263,15 @@ class MLP:
         return params
 
     def apply(self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass. Returns shape (N, 8) raw surrogate costs."""
+        """Forward pass. Returns face logits plus bounded continuous targets."""
         for i, (w, b) in enumerate(params):
             x = x @ w + b
             if i < len(params) - 1:
                 x = jax.nn.relu(x)
-        return x
+        face_logits = x[:, :N_FACES]
+        cp_target = _lo_cp + (_hi_cp - _lo_cp) * jax.nn.sigmoid(x[:, 6:7])
+        ang_target = _lo_ang + (_hi_ang - _lo_ang) * jax.nn.sigmoid(x[:, 7:8])
+        return jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -277,7 +292,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
     def cost(params, data, rng_solve):
         ctx = env.get_context_vector(data)  # (N_ENVS, 11)
-        c = mlp.apply(params, ctx)  # (N_ENVS, 8) raw surrogate costs
+        c = mlp.apply(params, ctx)  # (N_ENVS, 8) face logits + bounded targets
 
         if verbosity > 1:
             jax.debug.print(
@@ -297,7 +312,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
         if verbosity > 0:
             face_idx = jnp.argmax(face_onehot, axis=-1)
             jax.debug.print(
-                "rollout action face={face} contact_point={cp} angle={a}",
+                "rollout action\n  face={face}\n  contact_point={cp}\n  angle={a}",
                 face=face_idx,
                 cp=contact_point,
                 a=angle,
@@ -315,9 +330,10 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
         final_dists = t_distances[:, -1]
         task_loss = jnp.nanmean(final_dists)
-        # The MILP is largely scale-invariant in c, so lightly penalize large
-        # surrogate costs to keep smoothing effective.
-        c_reg = OUTPUT_REG_BETA * jnp.mean(jnp.square(c))
+        # The face logits are scale-invariant up to ordering, so lightly
+        # penalize them to keep smoothing effective. The targets are already
+        # bounded by the sigmoid head.
+        c_reg = OUTPUT_REG_BETA * jnp.mean(jnp.square(c[:, :N_FACES]))
         loss = task_loss + c_reg
 
         if verbosity > 0:
@@ -336,7 +352,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     # already JIT'd internally, so physics stays compiled.
     cost_and_grad = jax.value_and_grad(cost, argnums=0, has_aux=True)
 
-    print("SurCo-prior: training NN  y → c  (Gurobi MILP + Berthet et al. 2020 randomized-smoothing VJP)")
+    print("SurCo-prior: training NN  y → solver params  (Gurobi + randomized-smoothing VJP)")
 
     means = []
     stds = []
@@ -350,6 +366,9 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     for it in range(N_OPT_STEPS):
         if it == 0:
             print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
+
+        print()
+        print(f"|  ===  iter {it + 1:2d}  ===  |")
 
         if random_t_pose:
             env.reset()
@@ -371,11 +390,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
         if initial_mean_dist is None:
             initial_mean_dist = loss
 
-        print()
-        print(
-            f"===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | "
-            f"delta from initial: {100 * (loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms"
-        )
+        print(f"mean dist: {loss:.6f} [m] | delta from initial: {100 * (loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms")
 
         if n_bad_grads > 0:
             cprint(
@@ -388,7 +403,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
             mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
             std_change = jnp.std(jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
-            print(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}")
+            cprint(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}", "yellow")
 
         final_dists_np = np.asarray(t_distances[:, -1])
         means.append(float(np.nanmean(final_dists_np)))
@@ -401,17 +416,17 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
             save_filepath = save_dir / f"{it:03d}.mp4"
             env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
             if verbosity > 1:
-                print(f"  saved {save_filepath}")
+                cprint(f"  saved {save_filepath}", "green")
 
         nan_envs = np.where(np.isnan(final_dists_np))[0].tolist()
         if nan_envs:
             for env_idx in nan_envs:
-                print(f"  Env: {env_idx} - T distance is NaN")
+                cprint(f"  Env: {env_idx} - T distance is NaN", "red")
 
         if it == 0:
-            print(f"First iteration time: {time() - t_start:.2f} s")
+            cprint(f"First iteration time: {time() - t_start:.2f} s", "yellow")
 
-    print(f"\nOptimization took {time() - t_start:.2f} s total")
+    cprint(f"\nOptimization took {time() - t_start:.2f} s total", "green")
 
     # ── Plots ──────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(3, 2, figsize=(12, 12))
