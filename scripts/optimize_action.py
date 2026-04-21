@@ -33,6 +33,7 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 from termcolor import cprint
 import jax
+
 jax.config.update("jax_compilation_cache_dir", str(Path.home() / ".cache/jax_pusht619"))
 import jax.numpy as jnp
 import numpy as np

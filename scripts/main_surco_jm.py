@@ -289,12 +289,14 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
     def cost(params, data, rng_solve):
         ctx = env.get_context_vector(data)  # (N_ENVS, 11)
-        c = mlp.apply(params, ctx)          # (N_ENVS, 8) raw surrogate costs
+        c = mlp.apply(params, ctx)  # (N_ENVS, 8) raw surrogate costs
 
         if verbosity > 1:
             jax.debug.print(
                 "context  any_nan={n} min={lo:.3f} max={hi:.3f}",
-                n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max(),
+                n=jnp.any(jnp.isnan(ctx)),
+                lo=ctx.min(),
+                hi=ctx.max(),
             )
 
         # This is one clean primal solve at c. The K perturbed solves happen later,
@@ -306,7 +308,9 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
         if verbosity > 0:
             face_idx = jnp.argmax(face_onehot, axis=-1)
-            jax.debug.print("rollout action face={face} contact_point={cp} angle={a}", face=face_idx, cp=contact_point, a=angle)
+            jax.debug.print(
+                "rollout action face={face} contact_point={cp} angle={a}", face=face_idx, cp=contact_point, a=angle
+            )
 
         # _, _, t_distances, jpos_traj = env.step_pure_soft(
         _, _, t_distances, jpos_traj = env.step_pure(
@@ -341,15 +345,13 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     # already JIT'd internally, so physics stays compiled.
     cost_and_grad = jax.value_and_grad(cost, argnums=0, has_aux=True)
 
-    print(
-        "SurCo-prior: training NN  y → c  (Gurobi MILP + Berthet et al. 2020 randomized-smoothing VJP)"
-    )
+    print("SurCo-prior: training NN  y → c  (Gurobi MILP + Berthet et al. 2020 randomized-smoothing VJP)")
 
     means = []
     stds = []
-    face_hist = []       # list of (N_ENVS,) int — argmax face per env per iter
-    cp_hist = []         # list of (N_ENVS,) float — contact_point per env per iter
-    ang_hist = []        # list of (N_ENVS,) float — angle per env per iter
+    face_hist = []  # list of (N_ENVS,) int — argmax face per env per iter
+    cp_hist = []  # list of (N_ENVS,) float — contact_point per env per iter
+    ang_hist = []  # list of (N_ENVS,) float — angle per env per iter
 
     initial_mean_dist = None
     t_start = time()
@@ -393,16 +395,9 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
         if verbosity > 0:
             grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
-            mean_abs_change = jnp.mean(
-                jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])
-            ).item()
-            std_change = jnp.std(
-                jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])
-            ).item()
-            print(
-                f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, "
-                f"std |change|: {std_change:.6f}"
-            )
+            mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
+            std_change = jnp.std(jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
+            print(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}")
 
         final_dists_np = np.asarray(t_distances[:, -1])
         means.append(float(np.nanmean(final_dists_np)))
@@ -494,9 +489,7 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--problem_type", type=str, default="single_step", choices=["single_step", "multi_step"]
-    )
+    parser.add_argument("--problem_type", type=str, default="single_step", choices=["single_step", "multi_step"])
     parser.add_argument("--verbosity", type=int, default=0)
     parser.add_argument("--random-t-pose", action="store_true", help="Randomize problem instances each iteration")
     parser.add_argument("--record-video", action="store_true")
