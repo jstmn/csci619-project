@@ -124,6 +124,7 @@ FACE_END_POINTS = T_CORNERS[[1, 3, 4, 5, 7, 0]]
 _FACE_START_POINTS_JAX = jnp.asarray(FACE_START_POINTS)
 _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 _T_CORNERS_JAX = jnp.asarray(T_CORNERS)  # (8, 2) body-frame corners
+_DIST_CORNERS_JAX = jnp.asarray(T_CORNERS[[0, 3, 4, 7]])  # (4, 2) p0, p3, p4, p7 used for the distance metric
 
 
 def _plan_push_jax(
@@ -489,6 +490,7 @@ def _compute_phase_steps(dt: float, n_sim_steps: int) -> tuple[int, int]:
         "T_theta_idx",
         "T_target_x_idx",
         "T_target_y_idx",
+        "T_target_theta_idx",
         "nenvs",
         "check_t_displacement",
     ),
@@ -507,6 +509,7 @@ def _step_pure_impl(
     T_theta_idx: int,
     T_target_x_idx: int,
     T_target_y_idx: int,
+    T_target_theta_idx: int,
     nenvs: int,
     approach_steps: int,
     push_steps: int,
@@ -552,6 +555,11 @@ def _step_pure_impl(
     pin_blv = data._base_linear_velocity
     pin_bav = data._base_angular_velocity
     target_xy = jnp.stack([pin_jp[:, T_target_x_idx], pin_jp[:, T_target_y_idx]], axis=-1)
+    target_theta = pin_jp[:, T_target_theta_idx]
+    cos_tgt = jnp.cos(target_theta)
+    sin_tgt = jnp.sin(target_theta)
+    R_tgt = jnp.stack([jnp.stack([cos_tgt, -sin_tgt], axis=-1), jnp.stack([sin_tgt, cos_tgt], axis=-1)], axis=1)
+    target_corners = target_xy[:, None, :] + jnp.einsum("nij,kj->nki", R_tgt, _DIST_CORNERS_JAX)  # (nenvs, 4, 2)
 
     # ── Build pusher target trajectory ─────────────────────────────────
     approach_scales = jnp.linspace(0.0, 1.0, num=approach_steps)
@@ -625,7 +633,11 @@ def _step_pure_impl(
         ty = data.joint_positions[:, T_y_idx]
         tth = data.joint_positions[:, T_theta_idx]
         t_pose = jnp.stack([tx, ty, tth], axis=-1)
-        t_dist = jnp.linalg.norm(t_pose[:, :2] - target_xy, axis=-1)
+        cos_t = jnp.cos(tth)
+        sin_t = jnp.sin(tth)
+        R_t = jnp.stack([jnp.stack([cos_t, -sin_t], axis=-1), jnp.stack([sin_t, cos_t], axis=-1)], axis=1)
+        t_corners = jnp.stack([tx, ty], axis=-1)[:, None, :] + jnp.einsum("nij,kj->nki", R_t, _DIST_CORNERS_JAX)
+        t_dist = jnp.sum((t_corners - target_corners) ** 2, axis=(-1, -2))  # (nenvs,)
 
         return data, (t_pose, t_dist, data.joint_positions)
 
@@ -1084,6 +1096,7 @@ class PushTEnv:
             self._T_theta_idx,
             self._T_target_x_idx,
             self._T_target_y_idx,
+            self._T_target_theta_idx,
             self._nenvs,
             approach_steps,
             push_steps,
@@ -1134,6 +1147,7 @@ class PushTEnv:
             self._T_theta_idx,
             self._T_target_x_idx,
             self._T_target_y_idx,
+            self._T_target_theta_idx,
             self._nenvs,
             approach_steps,
             push_steps,
