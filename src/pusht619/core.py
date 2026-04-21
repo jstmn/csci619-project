@@ -29,7 +29,7 @@ import rod
 
 # Action bounds (enforced on concrete :class:`Action` and checked every rollout in ``_step_pure_impl``).
 CONTACT_POINT_BOUNDS = (0.2, 0.8)
-ANGLE_BOUNDS = (jnp.pi*0.2, jnp.pi*0.8)
+ANGLE_BOUNDS = (jnp.pi * 0.2, jnp.pi * 0.8)
 
 
 def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
@@ -307,22 +307,22 @@ def _t_wall_contact_forces_single(
     v_corners = t_vel_xy[None, :] + t_omega * jnp.stack([-r[:, 1], r[:, 0]], axis=-1)  # (8, 2)
 
     # Penetration depths into each wall (zero when not in contact).
-    pen_left   = jnp.maximum(0.0, -corners_world[:, 0])                        # x < 0
-    pen_right  = jnp.maximum(0.0, corners_world[:, 0] - WORKSPACE_WIDTH)       # x > W
-    pen_bottom = jnp.maximum(0.0, -corners_world[:, 1])                        # y < 0
-    pen_top    = jnp.maximum(0.0, corners_world[:, 1] - WORKSPACE_HEIGHT)      # y > H
+    pen_left = jnp.maximum(0.0, -corners_world[:, 0])  # x < 0
+    pen_right = jnp.maximum(0.0, corners_world[:, 0] - WORKSPACE_WIDTH)  # x > W
+    pen_bottom = jnp.maximum(0.0, -corners_world[:, 1])  # y < 0
+    pen_top = jnp.maximum(0.0, corners_world[:, 1] - WORKSPACE_HEIGHT)  # y > H
 
     # Closing rates (positive = moving toward the wall).
-    cr_left   = jnp.maximum(0.0, -v_corners[:, 0])
-    cr_right  = jnp.maximum(0.0,  v_corners[:, 0])
+    cr_left = jnp.maximum(0.0, -v_corners[:, 0])
+    cr_right = jnp.maximum(0.0, v_corners[:, 0])
     cr_bottom = jnp.maximum(0.0, -v_corners[:, 1])
-    cr_top    = jnp.maximum(0.0,  v_corners[:, 1])
+    cr_top = jnp.maximum(0.0, v_corners[:, 1])
 
     # Force magnitudes; damping only applies while in contact.
-    f_left   = jnp.where(pen_left   > 0.0, T_WALL_CONTACT_K * pen_left   + T_WALL_CONTACT_D * cr_left,   0.0)
-    f_right  = jnp.where(pen_right  > 0.0, T_WALL_CONTACT_K * pen_right  + T_WALL_CONTACT_D * cr_right,  0.0)
+    f_left = jnp.where(pen_left > 0.0, T_WALL_CONTACT_K * pen_left + T_WALL_CONTACT_D * cr_left, 0.0)
+    f_right = jnp.where(pen_right > 0.0, T_WALL_CONTACT_K * pen_right + T_WALL_CONTACT_D * cr_right, 0.0)
     f_bottom = jnp.where(pen_bottom > 0.0, T_WALL_CONTACT_K * pen_bottom + T_WALL_CONTACT_D * cr_bottom, 0.0)
-    f_top    = jnp.where(pen_top    > 0.0, T_WALL_CONTACT_K * pen_top    + T_WALL_CONTACT_D * cr_top,    0.0)
+    f_top = jnp.where(pen_top > 0.0, T_WALL_CONTACT_K * pen_top + T_WALL_CONTACT_D * cr_top, 0.0)
 
     # Net force per corner: left/bottom push +, right/top push -.
     F_corners = jnp.stack([f_left - f_right, f_bottom - f_top], axis=-1)  # (8, 2)
@@ -587,7 +587,10 @@ def _step_pure_impl(
         pusher_forces = PUSHER_KP * (target_xy_step - cur_xy) + PUSHER_KD * (target_vel_xy - cur_vel_xy)
         pusher_forces = jnp.clip(pusher_forces, -PUSHER_MAX_FORCE, PUSHER_MAX_FORCE)
         t_xy = jnp.stack([data.joint_positions[:, T_x_idx], data.joint_positions[:, T_y_idx]], axis=-1)
-        t_vel_xy = jnp.stack([data.joint_velocities[:, T_x_idx], data.joint_velocities[:, T_y_idx]], axis=-1,)
+        t_vel_xy = jnp.stack(
+            [data.joint_velocities[:, T_x_idx], data.joint_velocities[:, T_y_idx]],
+            axis=-1,
+        )
         t_theta = data.joint_positions[:, T_theta_idx]
         t_omega = data.joint_velocities[:, T_theta_idx]
 

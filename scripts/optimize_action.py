@@ -24,6 +24,7 @@ python scripts/optimize_action.py --record-video --verbosity 1
 from __future__ import annotations
 
 from time import time
+
 PROGRAM_START_TIME = time()
 from datetime import datetime
 from pathlib import Path
@@ -119,13 +120,17 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
             angle=angle,
             n_sim_steps=N_SIM_STEPS,
         )
-        assert t_distances.shape == (N_ENVS, N_SIM_STEPS), f"t_distances must be ({N_ENVS}, {N_SIM_STEPS}), got {t_distances.shape}"
+        assert t_distances.shape == (N_ENVS, N_SIM_STEPS), (
+            f"t_distances must be ({N_ENVS}, {N_SIM_STEPS}), got {t_distances.shape}"
+        )
         # Mean final distance; NaNs from diverged rollouts are ignored (cannot use
         # jnp.where(cond)[0] here — dynamic nonzero is illegal inside jit).
         final_dists = t_distances[:, -1]
         loss = jnp.nanmean(final_dists)
         if verbosity > 0:
-            jax.debug.print("t_dist   sum(is_nan)={n} final_dists={d}", n=jnp.sum(jnp.isnan(final_dists)), d=final_dists)
+            jax.debug.print(
+                "t_dist   sum(is_nan)={n} final_dists={d}", n=jnp.sum(jnp.isnan(final_dists)), d=final_dists
+            )
         return loss, (t_distances, jpos_traj, contact_point, angle)
 
     cost_and_grad = jax.jit(jax.value_and_grad(cost, argnums=0, has_aux=True))
@@ -165,11 +170,13 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
             initial_mean_dist = loss
         print()
         print(
-            f"===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {100*(loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms"
+            f"===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {100 * (loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms"
         )
 
         if n_bad_grads > 0:
-            cprint(f"  WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).", "red")
+            cprint(
+                f"  WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).", "red"
+            )
 
         # Check gradient statistics
         if verbosity > 0:
@@ -213,7 +220,6 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
             print(f"First iteration time: {time() - t_start:.2f} s")
 
     print(f"Optimization took {time() - t_start:.2f} s total")
-
 
     # ================================================
     # Plot results
@@ -282,4 +288,9 @@ if __name__ == "__main__":
     parser.add_argument("--record-video", action="store_true", help="Record a video of the optimization process")
     parser.add_argument("--verbosity", type=int, default=0, help="Verbosity level")
     args = parser.parse_args()
-    main(random_side=args.random_side, random_t_pose=args.random_t_pose, record_video=args.record_video, verbosity=args.verbosity)
+    main(
+        random_side=args.random_side,
+        random_t_pose=args.random_t_pose,
+        record_video=args.record_video,
+        verbosity=args.verbosity,
+    )
