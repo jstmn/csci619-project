@@ -142,12 +142,16 @@ def _plan_push_jax(
     carries zero gradient.
     """
     assert t_poses.shape == (nenvs, 3), f"t_poses must be (nenvs, 3), got {t_poses.shape}"
-    assert face.shape == (nenvs,), f"face must be (nenvs,), got {face.shape}"
+    assert face.shape in ((nenvs,), (nenvs, 6)), f"face must be (nenvs,) or (nenvs, 6), got {face.shape}"
     assert contact_point.shape == (nenvs,), f"contact_point must be (nenvs,), got {contact_point.shape}"
     assert angle.shape == (nenvs,), f"angle must be (nenvs,), got {angle.shape}"
 
-    face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2)
-    face_ends = _FACE_END_POINTS_JAX[face]  # (nenvs, 2)
+    if face.ndim == 1:
+        face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2) — hard gather, no gradient
+        face_ends = _FACE_END_POINTS_JAX[face]
+    else:
+        face_starts = face @ _FACE_START_POINTS_JAX  # (nenvs,6)@(6,2) → (nenvs,2), differentiable
+        face_ends = face @ _FACE_END_POINTS_JAX
     face_vectors = face_ends - face_starts
     face_lengths = jnp.linalg.norm(face_vectors, axis=1, keepdims=True)
     face_tangents = face_vectors / face_lengths
