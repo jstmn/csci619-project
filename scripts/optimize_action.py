@@ -21,17 +21,18 @@ unset LD_LIBRARY_PATH; python scripts/optimize_action.py
 
 from __future__ import annotations
 
-import json
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
+import matplotlib.pyplot as plt
+from termcolor import cprint
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pusht619.core import Action, PushTEnv
+from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
@@ -45,7 +46,8 @@ class MLP:
     Params are a list of (W, b) tuples — a plain JAX pytree, jit/grad compatible.
     """
 
-    def __init__(self, context_dim: int, hidden_dims: Sequence[int] = (64, 64)):
+    def __init__(self, context_dim: int, output_ranges: list[tuple[float, float]], hidden_dims: Sequence[int] = (64, 64)):
+        self.output_ranges = output_ranges
         self.layer_sizes = [context_dim, *hidden_dims, 2]
 
     def init(self, key: jax.Array) -> list[tuple[jnp.ndarray, jnp.ndarray]]:
@@ -64,15 +66,17 @@ class MLP:
             x = x @ w + b
             if i < len(params) - 1:
                 x = jax.nn.relu(x)
+        for i, (lo, hi) in enumerate(self.output_ranges):
+            x = x.at[:, i].set(lo + (hi - lo) * jax.nn.sigmoid(x[:, i]))   
         return x
 
 
-N_ENVS = 9
-N_SIM_STEPS = 25
 N_OPT_STEPS = 10
-LR_ACTION = 0.25  # for u_contact / u_angle (smooth)
+LR = 0.75  # for u_contact / u_angle (smooth)
+N_ENVS = 100
+N_SIM_STEPS = 100
 RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for variety.
-
+VERBOSE = False
 
 def main():
     env = PushTEnv(nenvs=N_ENVS, record_video=True, visualize=False)
@@ -82,7 +86,7 @@ def main():
     video_dir.mkdir(parents=True, exist_ok=True)
 
     # Context vector (dim=11): T_target_pose(3) | T_pose(3) | T_velocity(3) | pusher_xy(2)
-    mlp = MLP(context_dim=11)
+    mlp = MLP(context_dim=11, output_ranges=[CONTACT_POINT_BOUNDS, ANGLE_BOUNDS])
     params = mlp.init(jax.random.PRNGKey(0))
     rng = np.random.default_rng(seed=1)
     faces = jnp.asarray(rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32))
@@ -90,15 +94,15 @@ def main():
     def cost(params, data):
         ctx = env.get_context_vector(data)
         out = mlp.apply(params, ctx)  # (N_ENVS, 2)
-        contact_point = 0.1 + 0.8 * jax.nn.sigmoid(out[:, 0])  # CONTACT_POINT_BOUNDS = (0.1, 0.9)
-        angle = jnp.pi / 6 + (4 * jnp.pi / 6) * jax.nn.sigmoid(out[:, 1])  # ANGLE_BOUNDS = (pi/6, 5*pi/6)
+        contact_point, angle = out[:, 0], out[:, 1]
 
-        jax.debug.print("context  any_nan={n} min={lo:.3f} max={hi:.3f}", n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max())
-        jax.debug.print("mlp_out  any_nan={n}", n=jnp.any(jnp.isnan(out)))
-        jax.debug.print("contact_point, raw:  {pre}", pre=out[:, 0])
-        jax.debug.print("contact_point, post: {post}", post=contact_point)
-        jax.debug.print("angle        , raw:  {pre}", pre=out[:, 1])
-        jax.debug.print("angle        , post: {post}", post=angle)
+        if VERBOSE:
+            jax.debug.print("context  any_nan={n} min={lo:.3f} max={hi:.3f}", n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max())
+            jax.debug.print("mlp_out  any_nan={n}", n=jnp.any(jnp.isnan(out)))
+            jax.debug.print("contact_point, raw:  {pre}", pre=out[:, 0])
+            jax.debug.print("contact_point, post: {post}", post=contact_point)
+            jax.debug.print("angle        , raw:  {pre}", pre=out[:, 1])
+            jax.debug.print("angle        , post: {post}", post=angle)
 
         _, _, t_distances, jpos_traj = env.step_pure(
             data=data,
@@ -108,13 +112,18 @@ def main():
             n_sim_steps=N_SIM_STEPS,
         )
 
-        jax.debug.print("t_dist   any_nan={n} final={d}",
-            n=jnp.any(jnp.isnan(t_distances)), d=t_distances[:, -1])
+        if VERBOSE:
+            jax.debug.print("t_dist   any_nan={n} final={d}", n=jnp.any(jnp.isnan(t_distances)), d=t_distances[:, -1])
         return t_distances[:, -1].mean(), (t_distances, jpos_traj, contact_point, angle)
 
     cost_and_grad = jax.jit(jax.value_and_grad(cost, argnums=0, has_aux=True))
 
     print("Optimizing MLP params by gradient descent")
+    means = []
+    stds = []
+    maxs = []
+    mins = []
+    initial_mean_dist = None
     t_start = time.time()
     for it in range(N_OPT_STEPS):
         env.reset(seed=RESET_SEED)
@@ -123,27 +132,37 @@ def main():
         t_poses_0 = env.t_poses
         env_data_0 = env.data
         (loss, (t_distances, jpos_traj, contact_point, angle)), g_params = cost_and_grad(params, env_data_0)
-        params = jax.tree.map(lambda p, g: p - LR_ACTION * g, params, g_params)
+        params = jax.tree.map(lambda p, g: p - LR * g, params, g_params)
         dt = time.time() - t0
+        if initial_mean_dist is None:
+            initial_mean_dist = loss
         print()
-        print(f"  iter {it + 1:4d}: mean dist = {loss:.4f} m  ({dt * 1000:.1f} ms)")
+        print(f"  ===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {loss - initial_mean_dist:.6f} [m] | {dt * 1000:.1f} ms")
 
         # Check for NaNs in gradients
         has_nan = any(jnp.any(jnp.isnan(g)).item() for layer in g_params for g in layer)
         if has_nan:
-            print("  WARNING: NaN detected in gradients!")
+            cprint("  WARNING: NaN detected in gradients!", "red")
 
         # Check gradient statistics
-        grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
-        max_grad = max(jnp.max(g).item() for g in grad_abs_values)
-        mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR_ACTION * jnp.abs(g)).item() for g in grad_abs_values])).item()
-        std_change = jnp.std(jnp.array([jnp.std(LR_ACTION * jnp.abs(g)).item() for g in grad_abs_values])).item()
-        print(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}")
+        if VERBOSE:
+            grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
+            max_grad = max(jnp.max(g).item() for g in grad_abs_values)
+            mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
+            std_change = jnp.std(jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
+            print(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}")
+
+        # Save stats
+        means.append(t_distances[:, -1].mean())
+        stds.append(t_distances[:, -1].std())
+        maxs.append(t_distances[:, -1].max())
+        mins.append(t_distances[:, -1].min())
 
         # Save videos
         save_filepath = video_dir / f"{now}__learned_action_{it:03d}.mp4"
         env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
-        print(f"  saved {save_filepath}")
+        if VERBOSE:
+            print(f"  saved {save_filepath}")
 
         # On NaN: save debug JSON + per-failing-env video
         final_dists = np.asarray(t_distances[:, -1])
@@ -163,28 +182,31 @@ def main():
 
     print(f"Optimization took {time.time() - t_start:.2f} s total")
 
-    env.reset(seed=RESET_SEED)
-    out = mlp.apply(params, env.get_context_vector(env.data))
-    contact_point = jax.nn.sigmoid(out[:, 0])
-    angle = jnp.pi * jax.nn.sigmoid(out[:, 1])
-    final_action = Action(
-        face=np.asarray(faces),
-        contact_point=np.asarray(contact_point).reshape(N_ENVS, 1),
-        angle=np.asarray(angle).reshape(N_ENVS, 1),
-    )
-    result = env.step(final_action, n_sim_steps=N_SIM_STEPS)
-    t_distances = result.t_distances
 
-    print("\nLearned per-env action and resulting final distance:")
-    for i in range(N_ENVS):
-        print(
-            f"  env {i}: face={int(final_action.face[i, 0])}  "
-            f"contact_point={float(final_action.contact_point[i, 0]):.3f}  "
-            f"angle={float(final_action.angle[i, 0]):.3f}  "
-            f"final_distance={float(t_distances[i, -1]):.4f} m"
-        )
-
-    env.save_video_from_jpos_traj(Path("/tmp/learned_action.mp4"), np.asarray(result.jpos_traj))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    fig.suptitle(f"Optimization Results - N_ENVS={N_ENVS}, N_SIM_STEPS={N_SIM_STEPS}, N_OPT_STEPS={N_OPT_STEPS}")
+    # Left plot: mean with min and max
+    ax1.axhline(initial_mean_dist, label="initial mean", color="black")
+    ax1.plot(means, label="mean")
+    # ax1.plot(mins, label="min")
+    # ax1.plot(maxs, label="max")
+    ax1.legend()
+    ax1.set_title("Mean Distance with Min/Max")
+    ax1.set_xlabel("Iteration")
+    ax1.set_ylabel("Distance [m]")
+    ax1.grid(True, alpha=0.3)
+    
+    # Right plot: std
+    ax2.plot(stds, label="std")
+    ax2.legend()
+    ax2.set_title("Standard Deviation")
+    ax2.set_xlabel("Iteration")
+    ax2.set_ylabel("Distance Standard Deviation [m]")
+    ax2.grid(True, alpha=0.3)
+    fig.tight_layout()
+    plt.savefig(f"videos/{now}__optimization.png", bbox_inches="tight")
+    plt.close()
 
 
 if __name__ == "__main__":

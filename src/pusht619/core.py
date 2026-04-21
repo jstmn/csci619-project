@@ -339,7 +339,7 @@ class Action:
             a = np.asarray(self.angle)
             assert a.dtype in (np.float32, np.float64), f"angle must be float32/float64, got {a.dtype}"
             lo, hi = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
-            assert np.all((a >= lo) & (a <= hi)), f"angle must be in [{lo}, {hi}]"
+            assert np.all((a >= lo) & (a <= hi)), f"angle must be in [{lo}, {hi}], got {a}"
 
 
 @dataclass
