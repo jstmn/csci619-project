@@ -211,20 +211,22 @@ def test_step_pure_soft_is_differentiable_in_face() -> None:
 def test_t_pose_unchanged():
     """Debug a specific test"""
     env = PushTEnv(nenvs=1, record_video=True, visualize=False)
-    env.reset(seed=0, t_poses=np.array([[0.44149, 1.34959, 0.76838]], dtype=np.float32))
+    env.reset(seed=0, t_poses=np.array([[0.38668, 1.22616, -2.68507]], dtype=np.float32))
 
     data: js.data.JaxSimModelData = env.data
     # step_pure / _plan_push_jax expect per-env scalars shaped (nenvs,), not (nenvs, 1);
     # column vectors make contact_point[:, None] rank-3 and break the rotation einsum.
     faces = np.array([0], dtype=np.int32).reshape(-1)
-    contact_point = np.array([0.7272050578501773], dtype=np.float32).reshape(-1)
-    angle = np.array([0.6204681562681296], dtype=np.float32).reshape(-1)
-    _, _, t_dists, jpos_traj = env.step_pure(
+    contact_point = np.array([0.6577187796214783], dtype=np.float32).reshape(-1)
+    angle = np.array([0.7242890193265389], dtype=np.float32).reshape(-1)
+    _, t_poses, t_dists, jpos_traj = env.step_pure(
         data=data,
         face=jnp.asarray(faces, dtype=jnp.int32).reshape(-1),
         contact_point=jnp.asarray(contact_point, dtype=jnp.float32).reshape(-1),
         angle=jnp.asarray(angle, dtype=jnp.float32).reshape(-1),
-        n_sim_steps=100,
+        n_sim_steps=50,
     )
-    print(t_dists)
+    print(f"t_dists: {t_dists}")
+    print(f"t_poses: {t_poses}")
     env.save_video_from_jpos_traj("/tmp/test_t_pose_unchanged.mp4", jpos_traj)
+    print("xdg-open /tmp/test_t_pose_unchanged.mp4")

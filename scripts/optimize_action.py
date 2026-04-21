@@ -23,7 +23,8 @@ python scripts/optimize_action.py --record-video --verbosity 1
 
 from __future__ import annotations
 
-import time
+from time import time
+PROGRAM_START_TIME = time()
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
@@ -137,10 +138,13 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
     angles = []
     contact_points = []
     initial_mean_dist = None
-    t_start = time.time()
+    t_start = time()
     faces = rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32)
 
     for it in range(N_OPT_STEPS):
+        if it == 0:
+            print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
+
         if random_side:
             faces = rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32)
 
@@ -149,12 +153,14 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
         else:
             env.reset(seed=RESET_SEED)
 
-        t0 = time.time()
+        t0 = time()
         t_poses_0 = env.t_poses
         env_data_0 = env.data
-        (loss, (t_distances, jpos_traj, contact_point, angle)), g_params = cost_and_grad(params, env_data_0, faces)
+        (loss, (t_distances, jpos_traj, contact_point, angle)), g_raw = cost_and_grad(params, env_data_0, faces)
+        n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for layer in g_raw for x in layer)
+        g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
         params = jax.tree.map(lambda p, g: p - LR * g, params, g_params)
-        dt = time.time() - t0
+        dt = time() - t0
         if initial_mean_dist is None:
             initial_mean_dist = loss
         print()
@@ -162,10 +168,8 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
             f"===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {100*(loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms"
         )
 
-        # Check for NaNs in gradients
-        has_nan = any(jnp.any(jnp.isnan(g)).item() for layer in g_params for g in layer)
-        if has_nan:
-            cprint("  WARNING: NaN detected in gradients!", "red")
+        if n_bad_grads > 0:
+            cprint(f"  WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).", "red")
 
         # Check gradient statistics
         if verbosity > 0:
@@ -205,7 +209,10 @@ def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: 
                 print("    joint positions_0:   ", env_data_0.joint_positions[env_idx])
                 print("    joint velocities_0:  ", env_data_0.joint_velocities[env_idx])
 
-    print(f"Optimization took {time.time() - t_start:.2f} s total")
+        if it == 0:
+            print(f"First iteration time: {time() - t_start:.2f} s")
+
+    print(f"Optimization took {time() - t_start:.2f} s total")
 
 
     # ================================================

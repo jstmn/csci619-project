@@ -195,7 +195,10 @@ def _box_sdf_2d(p: jnp.ndarray, c: jnp.ndarray, h: jnp.ndarray) -> jnp.ndarray:
     Negative inside, positive outside; differentiable almost everywhere.
     """
     q = jnp.abs(p - c) - h
-    outside = jnp.linalg.norm(jnp.maximum(q, 0.0))
+    outside_q = jnp.maximum(q, 0.0)
+    # Safe norm: avoids NaN gradient of ||x||/||x|| at x=0 (happens when pusher
+    # lands exactly on a box corner).  1e-18 is negligible vs contact tolerances.
+    outside = jnp.sqrt(jnp.dot(outside_q, outside_q) + 1e-16)
     inside = jnp.minimum(jnp.maximum(q[0], q[1]), 0.0)
     return outside + inside
 
@@ -558,6 +561,7 @@ def _step_pure_impl(
         pusher_start[:, None, :] + approach_scales[None, :, None] * (pre_contact - pusher_start)[:, None, :]
     )
     push_targets = pre_contact[:, None, :] + push_scales[None, :, None] * push_direction[:, None, :]
+    pusher_targets = jnp.concatenate([approach_targets, push_targets], axis=1)
 
     workspace_margin = PUSHER_RADIUS
     lb = jnp.array([workspace_margin, workspace_margin])
@@ -582,15 +586,8 @@ def _step_pure_impl(
         )
         pusher_forces = PUSHER_KP * (target_xy_step - cur_xy) + PUSHER_KD * (target_vel_xy - cur_vel_xy)
         pusher_forces = jnp.clip(pusher_forces, -PUSHER_MAX_FORCE, PUSHER_MAX_FORCE)
-
-        t_xy = jnp.stack(
-            [data.joint_positions[:, T_x_idx], data.joint_positions[:, T_y_idx]],
-            axis=-1,
-        )
-        t_vel_xy = jnp.stack(
-            [data.joint_velocities[:, T_x_idx], data.joint_velocities[:, T_y_idx]],
-            axis=-1,
-        )
+        t_xy = jnp.stack([data.joint_positions[:, T_x_idx], data.joint_positions[:, T_y_idx]], axis=-1)
+        t_vel_xy = jnp.stack([data.joint_velocities[:, T_x_idx], data.joint_velocities[:, T_y_idx]], axis=-1,)
         t_theta = data.joint_positions[:, T_theta_idx]
         t_omega = data.joint_velocities[:, T_theta_idx]
 
@@ -794,8 +791,8 @@ class PushTEnv:
                 model=self._mj_multi_model,
                 data=self._mj_multi_data,
                 fps=int(1 / self._model.time_step),
-                width=1280,
-                height=1280,
+                width=2000,
+                height=2000,
             )
 
     @property
@@ -1045,7 +1042,7 @@ class PushTEnv:
         n_sim_steps: int = 100,
         *,
         check_t_displacement: bool = True,
-    ) -> tuple[js.data.JaxSimModelData, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ):
         """Pure, jittable, differentiable single-action rollout.
 
         Returns ``(data_new, t_poses, t_distances, joint_positions_traj)`` —
