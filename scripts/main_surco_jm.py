@@ -13,7 +13,7 @@ Definitions, single-step problem:
         [7]:   angle in ANGLE_BOUNDS = (0.2*pi, 0.8*pi)
 
   - c: surrogate cost vector / Dim=8
-        [0:6]: face logits  (fed to Gurobi MILP; gradient via Pogančić)
+        [0:6]: face logits  (fed to Gurobi MILP; gradient via randomized smoothing)
         [6]:   contact_point cost coefficient
         [7]:   angle cost coefficient
 
@@ -43,10 +43,12 @@ System design (SurCo-prior):
        sum(x[0:6])=1, x[0:6]∈{0,1}^6
        x[6] ∈ CONTACT_POINT_BOUNDS  (continuous)
        x[7] ∈ ANGLE_BOUNDS          (continuous)
-   Gradient via Pogančić et al. 2019 blackbox differentiation.
+   Gradient via Berthet et al. 2020 randomized smoothing through the MILP.
 3. Rollout via step_pure_soft (differentiable physics; one-hot face is valid input).
-4. Loss: nanmean of sum-of-squared corner distances at final timestep.
-5. Backprop through rollout + Pogančić VJP + NN to update NN params.
+4. Loss: average over K = RANDOMZED_SMOOTHING_K smoothed branches. Each branch samples
+   ε ~ N(0,I), sets c' = c + λ ε, solves x' = argmin c'^T x, and runs a full rollout from
+   the same post-reset initial state (fresh trajectory each branch).
+5. Backprop through each rollout + that branch's MILP VJP + NN.
 
 
 Run:
@@ -79,16 +81,17 @@ from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-N_OPT_STEPS = 50
-LR = 1.0
-N_ENVS = 4
+N_OPT_STEPS = 10
+LR = 0.5
+N_ENVS = 9
 N_SIM_STEPS = 50
 RESET_SEED = 0
 N_FACES = 6
+RANDOMZED_SMOOTHING_K = 10
 
-# Pogančić perturbation magnitude.
-# Too small → solver returns same x* for c and c', gradient ≈ 0.
-# Too large → gradient biased toward a faraway solution.
+# Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
+# Too small → perturbed solves often match x*; estimator variance high.
+# Too large → x_k far from x*; gradient bias grows.
 PERTURB_LAMBDA = 0.5
 
 
@@ -134,7 +137,9 @@ class _PersistentActionSolver:
         self.model.update()
         self.model.optimize()
         face_vals = np.array([self.xf[i].X for i in range(N_FACES)], dtype=np.float32)
-        return np.append(face_vals, [self.cp.X, self.ang.X]).astype(np.float32)
+        x = np.append(face_vals, [self.cp.X, self.ang.X]).astype(np.float32)
+        assert x.shape == (8,), f"x must be (8,), got {x.shape}"
+        return x
 
 
 _SOLVER = _PersistentActionSolver()
@@ -161,31 +166,40 @@ def _solve_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
 
 
 @jax.custom_vjp
-def milp_solver(c: jnp.ndarray) -> jnp.ndarray:
+def milp_solver(c: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
     """Differentiable Gurobi: c (N,8) → x_star (N,8).
 
-    Gradient via Pogančić et al. 2019:
-        x_prime = solve(c + λ · grad_x L)
-        ∂L/∂c   = -(x_star - x_prime) / λ
+    Backward (Berthet et al. 2020): Monte Carlo over K_in = RANDOMZED_SMOOTHING_K draws
+        ε_j ~ N(0, I),  x_j = solve(c + λ ε_j)
+        ∂L/∂c[n,i] ≈ (1/(K_in λ)) Σ_j ε_j[n,i] · (grad_x[n] · x_j[n])
+    where grad_x is ∂L/∂x from the same forward branch's rollout (see cost()).
     """
     return _solve_pure_callback(c)
 
 
-def _milp_fwd(c):
+def _milp_forward(c, rng):
     x_star = _solve_pure_callback(c)
-    return x_star, (c, x_star)
+    rng, sample_rng = jax.random.split(rng)
+    return x_star, (c, x_star, sample_rng)
 
 
-def _milp_bwd(res, grad_x):
-    c, x_star = res
+def _milp_backward(res, grad_x):
+    c, _x_star, sample_rng = res
     grad_x_safe = jnp.where(jnp.isfinite(grad_x), grad_x, 0.0).astype(jnp.float32)
-    c_prime = (c + PERTURB_LAMBDA * grad_x_safe).astype(jnp.float32)
-    x_prime = _solve_pure_callback(c_prime)
-    grad_c = -(x_star - x_prime) / PERTURB_LAMBDA
-    return (grad_c,)
+    grad_c = jnp.zeros_like(c)
+    key = sample_rng
+    for _ in range(RANDOMZED_SMOOTHING_K):
+        key, subkey = jax.random.split(key)
+        eps = jax.random.normal(subkey, c.shape, dtype=jnp.float32)
+        c_pert = (c + PERTURB_LAMBDA * eps).astype(jnp.float32)
+        x_k = _solve_pure_callback(c_pert)
+        inner = jnp.sum(grad_x_safe * x_k, axis=-1, keepdims=True)  # (N, 1)
+        grad_c = grad_c + eps * inner
+    grad_c = grad_c / (RANDOMZED_SMOOTHING_K * PERTURB_LAMBDA)
+    return (grad_c, None)
 
 
-milp_solver.defvjp(_milp_fwd, _milp_bwd)
+milp_solver.defvjp(_milp_forward, _milp_backward)
 
 
 # ── MLP: y → c ────────────────────────────────────────────────────────────────
@@ -194,7 +208,7 @@ milp_solver.defvjp(_milp_fwd, _milp_bwd)
 class MLP:
     """Maps context y (dim=11) → surrogate cost c (dim=8).
 
-    c[:6] = face cost coefficients  (fed to Gurobi MILP; Pogančić gradient)
+    c[:6] = face cost coefficients  (fed to Gurobi MILP; randomized-smoothing VJP)
     c[6]  = contact_point cost coefficient
     c[7]  = angle cost coefficient
 
@@ -233,57 +247,77 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     env = PushTEnv(nenvs=N_ENVS, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
-    save_dir = Path(f"videos/{now}")
+    save_dir = Path(f"videos/{now}__{problem_type}__SurCo-prior")
     save_dir.mkdir(parents=True, exist_ok=True)
 
     mlp = MLP(context_dim=11, hidden_dims=(128, 128))
     params = mlp.init(jax.random.PRNGKey(0))
 
-    def cost(params, data):
+    def cost(params, data, rng_solve):
         ctx = env.get_context_vector(data)  # (N_ENVS, 11)
         c = mlp.apply(params, ctx)          # (N_ENVS, 8) raw surrogate costs
-
-        # MILP: argmin c^T x s.t. one-hot face + continuous bounds (all enforced inside Gurobi).
-        x = milp_solver(c)                  # (N_ENVS, 8)
-        face_onehot = x[:, :N_FACES]        # (N_ENVS, 6)
-        contact_point = x[:, 6]             # (N_ENVS,)
-        angle = x[:, 7]                     # (N_ENVS,)
 
         if verbosity > 1:
             jax.debug.print(
                 "context  any_nan={n} min={lo:.3f} max={hi:.3f}",
                 n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max(),
             )
-            jax.debug.print("contact_point: {cp}", cp=contact_point)
-            jax.debug.print("angle: {a}", a=angle)
 
-        # step_pure_soft accepts one-hot face_weights — one-hot is valid input.
-        _, _, t_distances, jpos_traj = env.step_pure_soft(
-            data=data,
-            face_weights=face_onehot,
-            contact_point=contact_point,
-            angle=angle,
-            n_sim_steps=N_SIM_STEPS,
-            check_t_displacement=False,
-        )
+        # K smoothed branches: each perturbed cost c_k, MILP action x_k, full rollout from
+        # the same initial `data` (pure physics; independent trajectory per branch).
+        key = rng_solve
+        loss_acc = jnp.float32(0.0)
+        t_distances_last = jpos_traj_last = None
+        face_onehot_last = cp_last = ang_last = None
+        for _ in range(RANDOMZED_SMOOTHING_K):
+            key, k_branch = jax.random.split(key)
+            k_eps, k_milp = jax.random.split(k_branch)
+            eps = jax.random.normal(k_eps, c.shape, dtype=jnp.float32)
+            c_k = (c + PERTURB_LAMBDA * eps).astype(jnp.float32)
+            x_k = milp_solver(c_k, k_milp)  # (N_ENVS, 8)
+            face_onehot = x_k[:, :N_FACES]
+            contact_point = x_k[:, 6]
+            angle = x_k[:, 7]
 
-        final_dists = t_distances[:, -1]
-        loss = jnp.nanmean(final_dists)
+            if verbosity > 1:
+                jax.debug.print("contact_point: {cp}", cp=contact_point)
+                jax.debug.print("angle: {a}", a=angle)
+
+            _, _, t_distances, jpos_traj = env.step_pure_soft(
+                data=data,
+                face_weights=face_onehot,
+                contact_point=contact_point,
+                angle=angle,
+                n_sim_steps=N_SIM_STEPS,
+                check_t_displacement=False,
+            )
+
+            final_dists = t_distances[:, -1]
+            loss_acc = loss_acc + jnp.nanmean(final_dists)
+            t_distances_last = t_distances
+            jpos_traj_last = jpos_traj
+            face_onehot_last = face_onehot
+            cp_last = contact_point
+            ang_last = angle
+
+        loss = loss_acc / jnp.float32(RANDOMZED_SMOOTHING_K)
 
         if verbosity > 0:
             jax.debug.print(
-                "t_dist   sum(is_nan)={n} final_dists={d}",
-                n=jnp.sum(jnp.isnan(final_dists)),
-                d=final_dists,
+                "t_dist (last branch) sum(is_nan)={n} final_dists={d}",
+                n=jnp.sum(jnp.isnan(t_distances_last[:, -1])),
+                d=t_distances_last[:, -1],
             )
-        return loss, (t_distances, jpos_traj, face_onehot, contact_point, angle)
+        return loss, (t_distances_last, jpos_traj_last, face_onehot_last, cp_last, ang_last)
 
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
     # solve, so a JIT wrapper adds overhead without benefit. step_pure_soft is
     # already JIT'd internally, so physics stays compiled.
     cost_and_grad = jax.value_and_grad(cost, argnums=0, has_aux=True)
 
-    print("SurCo-prior: training NN  y → c  (Gurobi MILP + Pogančić VJP)")
+    print(
+        "SurCo-prior: training NN  y → c  (Gurobi MILP + Berthet et al. 2020 randomized-smoothing VJP)"
+    )
 
     means = []
     stds = []
@@ -305,7 +339,10 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
 
         t0 = time()
         env_data_0 = env.data
-        (loss, (t_distances, jpos_traj, face_onehot, cp_batch, ang_batch)), g_raw = cost_and_grad(params, env_data_0)
+        step_key = jax.random.PRNGKey(it)
+        (loss, (t_distances, jpos_traj, face_onehot, cp_batch, ang_batch)), g_raw = cost_and_grad(
+            params, env_data_0, step_key
+        )
 
         n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for layer in g_raw for x in layer)
         g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
@@ -368,7 +405,8 @@ def main(problem_type: str, verbosity: int, random_t_pose: bool, record_video: b
     fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     fig.suptitle(
         f"SurCo-prior  N_ENVS={N_ENVS}  N_SIM_STEPS={N_SIM_STEPS}  "
-        f"N_OPT_STEPS={N_OPT_STEPS}  RANDOM_T_POSE={random_t_pose}"
+        f"N_OPT_STEPS={N_OPT_STEPS}  K={RANDOMZED_SMOOTHING_K}  λ={PERTURB_LAMBDA}  "
+        f"RANDOM_T_POSE={random_t_pose}"
     )
     ax_mean, ax_std = axes[0, 0], axes[0, 1]
     ax_cp, ax_ang = axes[1, 0], axes[1, 1]
