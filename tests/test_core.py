@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import jax
+
 jax.config.update("jax_disable_jit", True)
 import jax.numpy as jnp
 

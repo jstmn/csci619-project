@@ -48,8 +48,7 @@ def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
         bad = np.where(~ok)[0]
         if len(bad):
             raise ValueError(
-                f"{name} must be finite and in [{lo}, {hi}]; bad env indices {bad.tolist()} "
-                f"values {arr[bad].tolist()}"
+                f"{name} must be finite and in [{lo}, {hi}]; bad env indices {bad.tolist()} values {arr[bad].tolist()}"
             )
 
 
@@ -783,8 +782,8 @@ class PushTEnv:
 
     def _update_multi_env_data(
         self,
-        base_position: np.ndarray,   # (nenvs, 3)
-        base_orientation: np.ndarray, # (nenvs, 4)
+        base_position: np.ndarray,  # (nenvs, 3)
+        base_orientation: np.ndarray,  # (nenvs, 4)
         joint_positions: np.ndarray,  # (nenvs, dofs)
     ) -> None:
         joint_names = self._model.joint_names()

@@ -46,7 +46,9 @@ class MLP:
     Params are a list of (W, b) tuples — a plain JAX pytree, jit/grad compatible.
     """
 
-    def __init__(self, context_dim: int, output_ranges: list[tuple[float, float]], hidden_dims: Sequence[int] = (64, 64)):
+    def __init__(
+        self, context_dim: int, output_ranges: list[tuple[float, float]], hidden_dims: Sequence[int] = (64, 64)
+    ):
         self.output_ranges = output_ranges
         self.layer_sizes = [context_dim, *hidden_dims, 2]
 
@@ -67,7 +69,7 @@ class MLP:
             if i < len(params) - 1:
                 x = jax.nn.relu(x)
         for i, (lo, hi) in enumerate(self.output_ranges):
-            x = x.at[:, i].set(lo + (hi - lo) * jax.nn.sigmoid(x[:, i]))   
+            x = x.at[:, i].set(lo + (hi - lo) * jax.nn.sigmoid(x[:, i]))
         return x
 
 
@@ -77,6 +79,7 @@ N_ENVS = 100
 N_SIM_STEPS = 100
 RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for variety.
 VERBOSE = False
+
 
 def main():
     env = PushTEnv(nenvs=N_ENVS, record_video=True, visualize=False)
@@ -97,7 +100,9 @@ def main():
         contact_point, angle = out[:, 0], out[:, 1]
 
         if VERBOSE:
-            jax.debug.print("context  any_nan={n} min={lo:.3f} max={hi:.3f}", n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max())
+            jax.debug.print(
+                "context  any_nan={n} min={lo:.3f} max={hi:.3f}", n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max()
+            )
             jax.debug.print("mlp_out  any_nan={n}", n=jnp.any(jnp.isnan(out)))
             jax.debug.print("contact_point, raw:  {pre}", pre=out[:, 0])
             jax.debug.print("contact_point, post: {post}", post=contact_point)
@@ -137,7 +142,9 @@ def main():
         if initial_mean_dist is None:
             initial_mean_dist = loss
         print()
-        print(f"  ===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {loss - initial_mean_dist:.6f} [m] | {dt * 1000:.1f} ms")
+        print(
+            f"  ===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {loss - initial_mean_dist:.6f} [m] | {dt * 1000:.1f} ms"
+        )
 
         # Check for NaNs in gradients
         has_nan = any(jnp.any(jnp.isnan(g)).item() for layer in g_params for g in layer)
@@ -182,9 +189,8 @@ def main():
 
     print(f"Optimization took {time.time() - t_start:.2f} s total")
 
-
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    
+
     fig.suptitle(f"Optimization Results - N_ENVS={N_ENVS}, N_SIM_STEPS={N_SIM_STEPS}, N_OPT_STEPS={N_OPT_STEPS}")
     # Left plot: mean with min and max
     ax1.axhline(initial_mean_dist, label="initial mean", color="black")
@@ -196,7 +202,7 @@ def main():
     ax1.set_xlabel("Iteration")
     ax1.set_ylabel("Distance [m]")
     ax1.grid(True, alpha=0.3)
-    
+
     # Right plot: std
     ax2.plot(stds, label="std")
     ax2.legend()
