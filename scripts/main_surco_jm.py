@@ -57,8 +57,8 @@ System design (SurCo-prior):
 
 # Example usage:
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
-python scripts/main_surco_jm.py --n-envs 16 --random-t-pose --verbosity 1
-python scripts/main_surco_jm.py --n-envs 25 --verbosity 1 --record-video
+python scripts/main_surco_jm.py --n-envs 100 --random-t-pose
+python scripts/main_surco_jm.py --n-envs 16 --verbosity 1 --record-video
 
 """
 
@@ -86,19 +86,20 @@ from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 N_OPT_STEPS = 200
-LR = 0.25
+LR = 0.1
 N_SIM_STEPS = 50
 RESET_SEED = 0
 N_FACES = 6
-RANDOMZED_SMOOTHING_K = 10
-FACE_OUTPUT_REG_BETA = 0.001
+RANDOMZED_SMOOTHING_K = 20
+# RANDOMZED_SMOOTHING_K = 10
+FACE_OUTPUT_REG_BETA = 0.01
 CP_TARGET_WEIGHT = 1.0
 ANG_TARGET_WEIGHT = 1.0
 
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
 # Too large → x_k far from x*; gradient bias grows.
-PERTURB_LAMBDA = 1.5
+PERTURB_LAMBDA = 3.0
 
 
 _SOLVER = ActionSolver()
@@ -169,8 +170,9 @@ def _milp_backward(res, grad_x):
             jax.debug.print("x_perturbed deltas")
             jax.debug.print("|__ face_0={face_0}", face_0=face_0)
             jax.debug.print("|__ face_k={face_k}", face_k=face_k)
-            jax.debug.print("|__ cp=  {delta_cp}", delta_cp=x_k[:, 6] - contact_point_0)
-            jax.debug.print("|__ a=   {delta_a}", delta_a=x_k[:, 7] - angle_0)
+            jax.debug.print("|__ d_face={d_face}", d_face=face_k - face_0)
+            jax.debug.print("|__ cp=    {delta_cp}", delta_cp=x_k[:, 6] - contact_point_0)
+            jax.debug.print("|__ a=     {delta_a}", delta_a=x_k[:, 7] - angle_0)
         inner = jnp.sum(grad_x_safe * x_k, axis=-1, keepdims=True)  # (N, 1)
         grad_c = grad_c + eps * inner
     grad_c = grad_c / (RANDOMZED_SMOOTHING_K * PERTURB_LAMBDA)
@@ -431,6 +433,7 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
         cprint(f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}", "green" if n_envs_better > n_envs_better_0 else "red")
         cprint(f"|____ face initial={initial_faces.tolist()}", "yellow")
         cprint(f"|____ face current={face_idx_np.tolist()}", "yellow")
+        cprint(f"|____ face diff=   {(face_idx_np - initial_faces).tolist()}", "yellow")
 
         # Print gradient statistics
         #
