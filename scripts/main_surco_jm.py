@@ -1,11 +1,11 @@
 """This script trains a SurCo model to solve the PushT problem.
 
 Definitions, single-step problem:
-  - y: problem instance / context vector / Dim=11:
+  - y: problem instance / context vector / Dim=9:
         [0:3]:   T_target_pose
         [4:6]:   T_pose
         [7:9]:   T_velocity
-        [10:11]: pusher_xy
+        # [10:11]: pusher_xy
 
   - x: decision variable vector AKA 'action' / Dim=8
         [0:6]: face. One hot encoding of the face.
@@ -58,6 +58,7 @@ System design (SurCo-prior):
 # Example usage:
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
 python scripts/main_surco_jm.py --n-envs 100 --random-t-pose
+python scripts/main_surco_jm.py --n-envs 64 --random-t-pose
 python scripts/main_surco_jm.py --n-envs 16  --random-t-pose --verbosity 1 --record-video
 python scripts/main_surco_jm.py --n-envs 16 --verbosity 1 --record-video
 
@@ -91,7 +92,7 @@ LR = 0.1
 N_SIM_STEPS = 50
 RESET_SEED = 0
 N_FACES = 6
-RANDOMZED_SMOOTHING_K = 20
+RANDOMZED_SMOOTHING_K = 30
 # RANDOMZED_SMOOTHING_K = 10
 FACE_OUTPUT_REG_BETA = 0.01
 CP_TARGET_WEIGHT = 1.0
@@ -202,7 +203,7 @@ def plot_results(
     save_filepath=None,
     open_after_save=False,
 ):
-    initial_mean_dist = means[0]
+    initial_mean_loss = means[0]
     fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  n_sim_steps={n_sim_steps}  "
@@ -213,7 +214,7 @@ def plot_results(
     ax_cp, ax_ang = axes[1, 0], axes[1, 1]
     ax_face, ax_delta = axes[2, 0], axes[2, 1]
 
-    ax_mean.axhline(float(initial_mean_dist), label="initial mean", color="black", linestyle="--")
+    ax_mean.axhline(float(initial_mean_loss), label="initial mean", color="black", linestyle="--")
     ax_mean.plot(means, label="mean")
     ax_mean.legend()
     ax_mean.set_title("Mean Distance")
@@ -240,12 +241,13 @@ def plot_results(
     ax_delta.grid(True, alpha=0.3)
 
     for env_idx in range(min(n_envs, 5)):
-        p1, _ = ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}", alpha=0.5)
-        ax_cp.scatter([cp[env_idx] for cp in cp_hist], color=p1.get_color())
-        p2, _ = ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}", alpha=0.5)
-        ax_ang.scatter([a[env_idx] for a in ang_hist], color=p2.get_color())
-        p3, _ = ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}", alpha=0.5)
-        ax_face.scatter([f[env_idx] for f in face_hist], color=p3.get_color())
+        x1 = np.arange(len(cp_hist))
+        p1 = ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}", alpha=0.5)
+        ax_cp.scatter(x1, [cp[env_idx] for cp in cp_hist], color=p1[0].get_color())
+        p2 = ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}", alpha=0.5)
+        ax_ang.scatter(x1, [a[env_idx] for a in ang_hist], color=p2[0].get_color())
+        p3 = ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}", alpha=0.5)
+        ax_face.scatter(x1, [f[env_idx] for f in face_hist], color=p3[0].get_color())
 
     lo_cp, hi_cp = CONTACT_POINT_BOUNDS
     lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
@@ -292,8 +294,6 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
 
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
-    eval_t_pose_0 = env.t_poses[0].copy()
-    eval_target_pose_0 = env.target_poses[0].copy()
     now = datetime.now().strftime("%d__%H:%M:%S")
     save_dir = Path(f"logs/{now}__{problem_type}__n-envs:{n_envs}__SurCo-prior")
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -301,11 +301,11 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     os.system(f"xdg-open {save_dir}")
 
-    mlp = MLP(context_dim=11, hidden_dims=(128, 128))
+    mlp = MLP(context_dim=9, hidden_dims=(128, 128))
     params = mlp.init(jax.random.PRNGKey(0))
 
     def cost(params, data, rng_solve):
-        ctx = env.get_context_vector(data)  # (n_envs, 11)
+        ctx = env.get_context_vector(data)  # (n_envs, 9)
         c = mlp.apply(params, ctx)  # (n_envs, 18) face logits + per-face bounded targets
 
         if verbosity > 1:
@@ -383,7 +383,7 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
     ang_hist = []  # list of (n_envs,) float — angle per env per iter
 
     n_envs_better_0 = None
-    initial_mean_dist = None
+    initial_mean_loss = None
     initial_final_dists = None
     initial_faces = None
     t_start = time()
@@ -395,16 +395,12 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
         print()
         print(f"|  ===  iter {it + 1:2d}  ===  |")
 
+        is_eval_step = (it % RANDOM_T_POSE_EVAL_EVERY) == 0
         if random_t_pose:
-            env.reset()
-            # Every N iterations, keep env 0 fixed as a consistent evaluation case
-            # while the rest of the batch stays randomized.
-            if (it + 1) % RANDOM_T_POSE_EVAL_EVERY == 0:
-                t_poses = env.t_poses
-                target_poses = env.target_poses
-                t_poses[0] = eval_t_pose_0
-                target_poses[0] = eval_target_pose_0
-                env.reset(target_poses=target_poses, t_poses=t_poses)
+            if is_eval_step:
+                env.reset(0)
+            else:
+                env.reset()
         else:
             env.reset(seed=RESET_SEED)
 
@@ -436,17 +432,21 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
 
         # Print results
         #
-        if initial_mean_dist is None:
-            initial_mean_dist = loss
+        if initial_mean_loss is None:
+            initial_mean_loss = loss
         if initial_final_dists is None:
             initial_final_dists = final_dists_np.copy()
         if initial_faces is None:
             initial_faces = face_idx_np.copy()
+        if random_t_pose:
+            if is_eval_step:
+                cprint(f"|____ eval step: using environment from iteration 0", "cyan")
+            cprint(f"|____ mean dist: {loss:.5f} [m] | {dt * 1000:.1f} ms", "green" if loss < initial_mean_loss else "red")
         if n_envs_better_0 is None:
-            n_envs_better_0 = sum(final_dists_np < initial_mean_dist - 0.05)
-        delta_cm = 100 * (loss - initial_mean_dist)
-        cprint(f"|____ mean dist: {loss:.5f} [m] | delta from initial: {delta_cm:.3f} [cm] | initial mean: {initial_mean_dist:.5f} [m] | {dt * 1000:.1f} ms", "green" if delta_cm < 0 else "red")
-        n_envs_better = sum(final_dists_np < initial_mean_dist - 0.05)
+            n_envs_better_0 = sum(final_dists_np < initial_mean_loss - 0.05)
+        delta_cm = 100 * (loss - initial_mean_loss)
+        cprint(f"|____ mean dist: {loss:.5f} [m] | delta from initial: {delta_cm:.3f} [cm] | initial mean: {initial_mean_loss:.5f} [m] | {dt * 1000:.1f} ms", "green" if delta_cm < 0 else "red")
+        n_envs_better = sum(final_dists_np < initial_mean_loss - 0.05)
         cprint(f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}", "green" if n_envs_better > n_envs_better_0 else "red")
         cprint(f"|____ face initial={initial_faces.tolist()}", "yellow")
         cprint(f"|____ face current={face_idx_np.tolist()}", "yellow")

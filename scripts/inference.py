@@ -76,7 +76,6 @@ def main(
         ctx = env.get_context_vector(env.data)
         c = np.asarray(mlp.apply(params, ctx))
         x_star = solver.solve_batch(c)
-
         face_onehot = x_star[:, :6]
         face_idx = np.argmax(face_onehot, axis=-1)
         contact_point = x_star[:, 6]
@@ -106,10 +105,10 @@ def main(
         final_dists = np.asarray(result.t_distances[:, -1])
         print(f"\nFinal distances={np.round(final_dists, 6).tolist()}")
         print(f"Mean final distance={float(np.nanmean(final_dists)):.6f} [m]")
-        print(f"Std final distance={float(np.nanstd(final_dists)):.6f} [m]")
+        # print(f"Std final distance={float(np.nanstd(final_dists)):.6f} [m]")
 
     if record_video:
-        video_path = save_dir / f"inference__{n_planning_steps}steps.mp4"
+        video_path = save_dir / f"inference__n-steps:{n_planning_steps}__n-envs:{n_envs}.mp4"
         env.save_video(video_path)
         print(f"Saved video to {video_path}")
         os.system(f"xdg-open {save_dir}")
@@ -118,7 +117,7 @@ def main(
 
 python scripts/inference.py \
     --checkpoint logs/21__22:32:47__single_step__n-envs:16__SurCo-prior/checkpoints/mlp_iter_200.npz \
-    --n-envs 1 --random-t-pose --record-video --save-dir logs/21__22:32:47__single_step__n-envs:16__SurCo-prior/checkpoints/mlp_iter_200
+    --n-envs 4 --random-t-pose --record-video --save-dir logs/21__22:32:47__single_step__n-envs:16__SurCo-prior/checkpoints/mlp_iter_200
 """
 
 if __name__ == "__main__":

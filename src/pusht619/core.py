@@ -872,9 +872,9 @@ class PushTEnv:
                     ],
                     axis=-1,
                 ),  # T velocity
-                jnp.stack(
-                    [data.joint_positions[:, self._pusher_x_idx], data.joint_positions[:, self._pusher_y_idx]], axis=-1
-                ),  # pusher xy
+                # jnp.stack(
+                #     [data.joint_positions[:, self._pusher_x_idx], data.joint_positions[:, self._pusher_y_idx]], axis=-1
+                # ),  # pusher xy
             ],
             axis=-1,
         )
@@ -1197,13 +1197,7 @@ class PushTEnv:
 
             if self._record_video:
                 for step_idx in range(n_sim_steps):
-                    for env_idx, helper in enumerate(self._mj_model_helpers):
-                        helper.set_base_position(position=base_pos_np[env_idx])
-                        helper.set_base_orientation(orientation=base_quat_np[env_idx])
-                        helper.set_joint_positions(
-                            positions=jpos_traj_np[env_idx, step_idx],
-                            joint_names=joint_names,
-                        )
+                    self._update_multi_env_data(base_pos_np, base_quat_np, jpos_traj_np[:, step_idx, :])
                     self._recorder.record_frame(camera_name="t_block_cam")
 
             if self._visualizer is not None:
