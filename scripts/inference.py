@@ -15,12 +15,13 @@ from pusht619.models import MLP, ActionSolver
 N_SIM_STEPS = 50
 RESET_SEED = 0
 
+
 def load_checkpoint(checkpoint_path: Path) -> tuple[MLP, list[tuple[jnp.ndarray, jnp.ndarray]]]:
     checkpoint = np.load(checkpoint_path)
     layer_sizes = checkpoint["layer_sizes"].astype(np.int32).tolist()
     # assert layer_sizes[0] == 11, f"Expected context dim 11, got {layer_sizes[0]}"
     hidden_dims = tuple(layer_sizes[1:-1])
-    mlp = MLP(context_dim=layer_sizes[0], hidden_dims=hidden_dims)
+    mlp = MLP(context_dim=layer_sizes[0], hidden_dims=hidden_dims, output_dim=layer_sizes[-1])
 
     cp_bounds = tuple(float(x) for x in checkpoint["cp_bounds"])
     ang_bounds = tuple(float(x) for x in checkpoint["ang_bounds"])
@@ -41,11 +42,7 @@ def format_solver_params(c: np.ndarray) -> str:
     face_costs = np.array2string(c[:n_faces], precision=4, floatmode="fixed")
     cp_targets = np.array2string(c[n_faces : 2 * n_faces], precision=4, floatmode="fixed")
     ang_targets = np.array2string(c[2 * n_faces : 3 * n_faces], precision=4, floatmode="fixed")
-    return (
-        f"face_costs={face_costs}\n"
-        f"    cp_targets={cp_targets}\n"
-        f"    ang_targets={ang_targets}"
-    )
+    return f"face_costs={face_costs}\n    cp_targets={cp_targets}\n    ang_targets={ang_targets}"
 
 
 def main(
@@ -129,7 +126,7 @@ def main(
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    video_path = save_dir / f"inference__n-steps:{n_planning_steps}__n-envs:{n_envs}.mp4"
+    video_path = save_dir / f"inference__n-steps:{n_planning_steps}__n-envs:{n_envs}__seed:{seed}.mp4"
     plot_path = str(video_path).replace(".mp4", ".png")
     plt.savefig(plot_path, bbox_inches="tight", dpi=150)
     plt.close()
@@ -141,11 +138,13 @@ def main(
         print(f"Saved video to {video_path}")
         os.system(f"xdg-open {save_dir}")
 
+
 """ Example usage:
 
 CKPT=logs/22__00:59:01__single_step__n-envs:64__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_1000.npz
-CKPT=logs/22__01:03:11__single_step__n-envs:64__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_1000.npz
 CKPT=logs/22__01:08:13__single_step__n-envs:16__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_1000.npz
+CKPT=logs/22__01:03:11__single_step__n-envs:64__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_1000.npz
+CKPT=logs/22__01:03:11__single_step__n-envs:64__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_250.npz
 
 python scripts/inference.py --checkpoint ${CKPT} --n-envs 16 --random-t-pose --record-video
 """
@@ -154,7 +153,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to a saved .npz MLP checkpoint")
     parser.add_argument("--n-envs", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=RESET_SEED)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--random-t-pose", action="store_true", help="Use a random reset instead of a fixed seed")
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--verbosity", type=int, default=0)

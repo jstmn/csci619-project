@@ -74,7 +74,7 @@ N_EVAL_ENVS = 16
 CKPT_PATH = Path("checkpoints/surco_prior_params.npz")
 
 
-N_FACES = 6
+NUM_FACES = 6
 # ── 1. Gurobi: the combinatorial solver g_Ω ───────────────────────────────────
 #
 # Persistent solver: build the model once at module load, reuse across all
@@ -97,10 +97,10 @@ class _PersistentFaceSolver:
         self.model.setParam("Threads", 1)
         # Presolve is unhelpful for a 6-var problem and adds overhead.
         self.model.setParam("Presolve", 0)
-        self.x = self.model.addVars(N_FACES, vtype=GRB.BINARY, name="x")
-        self.model.addConstr(gp.quicksum(self.x[i] for i in range(N_FACES)) == 1)
+        self.x = self.model.addVars(NUM_FACES, vtype=GRB.BINARY, name="x")
+        self.model.addConstr(gp.quicksum(self.x[i] for i in range(NUM_FACES)) == 1)
         # Objective will be mutated per solve; initialize to zeros.
-        self.model.setObjective(gp.quicksum(0.0 * self.x[i] for i in range(N_FACES)), GRB.MINIMIZE)
+        self.model.setObjective(gp.quicksum(0.0 * self.x[i] for i in range(NUM_FACES)), GRB.MINIMIZE)
         self.model.update()
 
     def solve(self, c_face: np.ndarray) -> np.ndarray:
@@ -110,12 +110,12 @@ class _PersistentFaceSolver:
         # uniform cost so Gurobi still returns *something*. We also surface
         # this upstream so the training loop can skip the step.
         if not np.all(np.isfinite(c_face)):
-            c_face = np.zeros(N_FACES, dtype=np.float32)
-        for i in range(N_FACES):
+            c_face = np.zeros(NUM_FACES, dtype=np.float32)
+        for i in range(NUM_FACES):
             self.x[i].Obj = float(c_face[i])
         self.model.update()
         self.model.optimize()
-        return np.array([self.x[i].X for i in range(N_FACES)], dtype=np.float32)
+        return np.array([self.x[i].X for i in range(NUM_FACES)], dtype=np.float32)
 
 
 _SOLVER = _PersistentFaceSolver()
@@ -128,7 +128,7 @@ def gurobi_solve_batch(c_face_batch: np.ndarray) -> np.ndarray:
     prevents a single poisoned env from killing the whole training run.
     """
     N = c_face_batch.shape[0]
-    out = np.zeros((N, N_FACES), dtype=np.float32)
+    out = np.zeros((N, NUM_FACES), dtype=np.float32)
     for i in range(N):
         out[i] = _SOLVER.solve(c_face_batch[i])
     return out
@@ -216,7 +216,7 @@ def c_to_action(c: jnp.ndarray):
     """c (N,8) → (face_onehot, contact_point, angle). Gurobi on face, sigmoid
     on the rest. Returned face is one-hot; step_pure_soft accepts this as a
     valid `face_weights` argument (weight 1 on chosen face, 0 elsewhere)."""
-    c_face = c[:, :N_FACES]
+    c_face = c[:, :NUM_FACES]
     u_contact = c[:, 6]
     u_angle = c[:, 7]
     face_onehot = milp_face_solver(c_face)  # (N, 6), differentiable
@@ -408,7 +408,7 @@ def evaluate_prior(
     y = extract_y(env.data, target_xy)
 
     c = SurCoPrior().apply(params, y)
-    face_onehot = np.asarray(_solve_pure_callback(c[:, :N_FACES]))
+    face_onehot = np.asarray(_solve_pure_callback(c[:, :NUM_FACES]))
     face = np.argmax(face_onehot, axis=-1).astype(np.int32).reshape(-1, 1)
     contact = np.asarray(jax.nn.sigmoid(c[:, 6])).reshape(-1, 1)
     angle = np.asarray(jnp.pi * jax.nn.sigmoid(c[:, 7])).reshape(-1, 1)
@@ -442,7 +442,7 @@ def hybrid_finetune(params, env: PushTEnv, seed: int = 9999, save_video: bool = 
     y = extract_y(data0, target_xy)
 
     c_init = SurCoPrior().apply(params, y)
-    c_face = c_init[:, :N_FACES]
+    c_face = c_init[:, :NUM_FACES]
     u_contact = c_init[:, 6]
     u_angle = c_init[:, 7]
 

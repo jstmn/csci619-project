@@ -29,7 +29,7 @@ import rod
 
 # Action bounds (enforced on concrete :class:`Action` and checked every rollout in ``_step_pure_impl``).
 CONTACT_POINT_BOUNDS = (0.2, 0.8)
-ANGLE_BOUNDS = (jnp.pi * 0.2, jnp.pi * 0.8)
+ANGLE_BOUNDS = (jnp.pi * 0.25, jnp.pi * 0.75)
 
 
 def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
@@ -57,7 +57,7 @@ WORKSPACE_WIDTH = 1.5
 WORKSPACE_HEIGHT = 1.5
 PUSHER_RADIUS = 0.01
 PUSHER_CLEARANCE = 0.005
-PUSHER_APPROACH_DISTANCE = 0.04
+PUSHER_APPROACH_DISTANCE = 0.005  # 0.04
 DEFAULT_PUSH_DISTANCE = 0.30
 PUSHER_KP = 400.0
 PUSHER_KD = 40.0
@@ -67,8 +67,8 @@ PUSHER_MAX_FORCE = 80.0
 # The approach phase moves the pusher from `pusher_start` to `pre_contact`
 # (`PUSHER_APPROACH_DISTANCE`) at `PUSHER_APPROACH_VELOCITY`; the push phase
 # then advances `DEFAULT_PUSH_DISTANCE` at `PUSHER_PUSH_VELOCITY`.  Any leftover
-PUSHER_APPROACH_VELOCITY = 4.0  # m/s
-PUSHER_PUSH_VELOCITY = 2.0  # m/s
+PUSHER_APPROACH_VELOCITY = 8.0  # 4.0 # m/s
+PUSHER_PUSH_VELOCITY = 1.0  # m/s
 
 # JaxSim only supports point-vs-terrain contacts, not body-vs-body, so we add
 # our own analytical spring-damper contact between the pusher and the T block.
@@ -91,7 +91,7 @@ T_WALL_CONTACT_D = 80.0  # N·s/m
 # used for Coulomb rotational friction.
 T_MASS = 0.6  # kg, matches the SDF <mass> on link t_block
 _GRAVITY_MAG = 9.81
-FRICTION_SCALE = 2.0
+FRICTION_SCALE = 6.0
 T_FLOOR_MU = FRICTION_SCALE * 0.35  # Coulomb coefficient
 T_FLOOR_C_LIN = FRICTION_SCALE * 2.0  # N·s/m  (viscous linear)
 T_FLOOR_C_ROT = FRICTION_SCALE * 0.02  # N·m·s/rad  (viscous rotational)
@@ -119,8 +119,13 @@ T_CORNERS = np.array(
     ],
     dtype=np.float32,
 )
-FACE_START_POINTS = T_CORNERS[[0, 2, 3, 4, 6, 7]]
-FACE_END_POINTS = T_CORNERS[[1, 3, 4, 5, 7, 0]]
+# Restrict contact to the A/E/C faces by aliasing the 6 face slots onto only
+# those three physical edges. Per the READM
+FACE_START_POINTS = T_CORNERS[[0, 7, 6, 3]]
+FACE_END_POINTS = T_CORNERS[[1, 0, 7, 4]]
+NUM_FACES = len(FACE_START_POINTS)
+# FACE_START_POINTS = T_CORNERS[[0, 2, 3, 4, 6, 7]]
+# FACE_END_POINTS = T_CORNERS[[1, 3, 4, 5, 7, 0]]
 _FACE_START_POINTS_JAX = jnp.asarray(FACE_START_POINTS)
 _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 _T_CORNERS_JAX = jnp.asarray(T_CORNERS)  # (8, 2) body-frame corners
@@ -137,12 +142,14 @@ def _plan_push_jax(
     """JAX re-implementation of `_plan_push`.
 
     Pure and differentiable w.r.t. `contact_point`, `angle`, `t_poses`, and —
-    when `face` is passed as a `(nenvs, 6)` float array of per-face weights —
+    when `face` is passed as a `(nenvs, NUM_FACES)` float array of per-face weights —
     also w.r.t. `face`. A `(nenvs,)` int `face` behaves like a hard gather and
     carries zero gradient.
     """
     assert t_poses.shape == (nenvs, 3), f"t_poses must be (nenvs, 3), got {t_poses.shape}"
-    assert face.shape in ((nenvs,), (nenvs, 6)), f"face must be (nenvs,) or (nenvs, 6), got {face.shape}"
+    assert face.shape in ((nenvs,), (nenvs, NUM_FACES)), (
+        f"face must be (nenvs,) or (nenvs, NUM_FACES), got {face.shape}"
+    )
     assert contact_point.shape == (nenvs,), f"contact_point must be (nenvs,), got {contact_point.shape}"
     assert angle.shape == (nenvs,), f"angle must be (nenvs,), got {angle.shape}"
 
@@ -150,7 +157,7 @@ def _plan_push_jax(
         face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2) — hard gather, no gradient
         face_ends = _FACE_END_POINTS_JAX[face]
     else:
-        face_starts = face @ _FACE_START_POINTS_JAX  # (nenvs,6)@(6,2) → (nenvs,2), differentiable
+        face_starts = face @ _FACE_START_POINTS_JAX  # (nenvs,NUM_FACES)@(NUM_FACES,2) → (nenvs,2), differentiable
         face_ends = face @ _FACE_END_POINTS_JAX
     face_vectors = face_ends - face_starts
     face_lengths = jnp.linalg.norm(face_vectors, axis=1, keepdims=True)
@@ -809,9 +816,9 @@ class PushTEnv:
             self._recorder = jaxsim.mujoco.MujocoVideoRecorder(
                 model=self._mj_multi_model,
                 data=self._mj_multi_data,
-                fps=int(1 / self._model.time_step),
-                width=2000,
-                height=2000,
+                fps=int(1 / self._model.time_step / 12),
+                width=2500,
+                height=2500,
             )
 
     @property
@@ -1132,8 +1139,8 @@ class PushTEnv:
         :data:`ANGLE_BOUNDS`; otherwise the rollout raises ``ValueError``.
         """
         assert n_sim_steps > 0, "n_sim_steps must be > 0"
-        assert face_weights.shape == (self._nenvs, 6), (
-            f"face_weights must be ({self._nenvs}, 6), got {face_weights.shape}"
+        assert face_weights.shape == (self._nenvs, NUM_FACES), (
+            f"face_weights must be ({self._nenvs}, NUM_FACES), got {face_weights.shape}"
         )
 
         approach_steps, push_steps = _compute_phase_steps(float(self._model.time_step), n_sim_steps)

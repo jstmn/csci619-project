@@ -26,7 +26,7 @@ import pytest
 from pusht619.core import ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, Action, PushTEnv
 from scripts.training_loop import (
     CKPT_PATH,
-    N_FACES,
+    NUM_FACES,
     N_SIM_STEPS,
     SurCoPrior,
     _solve_pure_callback,
@@ -82,7 +82,7 @@ def run_chain(
     for k in range(n_pushes):
         y = extract_y(env.data, target_xy)
         c = SurCoPrior().apply(params, y)
-        face_onehot = np.asarray(_solve_pure_callback(c[:, :N_FACES]))
+        face_onehot = np.asarray(_solve_pure_callback(c[:, :NUM_FACES]))
         face = np.argmax(face_onehot, axis=-1).astype(np.int32).reshape(-1, 1)
         lo_cp, hi_cp = CONTACT_POINT_BOUNDS
         lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
