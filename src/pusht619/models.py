@@ -51,17 +51,17 @@ _mid_ang = 0.5 * (_lo_ang + _hi_ang)
 # ── MLP: y → c ────────────────────────────────────────────────────────────────
 
 class MLP:
-    """Maps context y (dim=11) → solver parameters c (dim=8).
+    """Maps context y (dim=11) → solver parameters c.
 
-    c[:6] = face cost coefficients
-    c[6]  = contact_point target, squashed into CONTACT_POINT_BOUNDS
-    c[7]  = angle target, squashed into ANGLE_BOUNDS
+    c[:6]    = face cost coefficients
+    c[6:12]  = per-face contact_point targets, squashed into CONTACT_POINT_BOUNDS
+    c[12:18] = per-face angle targets, squashed into ANGLE_BOUNDS
 
     Params: list of (W, b) tuples — plain JAX pytree, jit/grad compatible.
     """
 
     def __init__(self, context_dim: int, hidden_dims: Sequence[int] = (128, 128)):
-        self.layer_sizes = [context_dim, *hidden_dims, 8]
+        self.layer_sizes = [context_dim, *hidden_dims, 3 * N_FACES]
         self.cp_bounds = (_lo_cp, _hi_cp)
         self.ang_bounds = (_lo_ang, _hi_ang)
 
@@ -76,7 +76,7 @@ class MLP:
         return params
 
     def apply(self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass. Returns face logits plus bounded continuous targets."""
+        """Forward pass. Returns face logits plus per-face bounded targets."""
         for i, (w, b) in enumerate(params):
             x = x @ w + b
             if i < len(params) - 1:
@@ -84,9 +84,9 @@ class MLP:
         face_logits = x[:, :N_FACES]
         cp_lo, cp_hi = self.cp_bounds
         ang_lo, ang_hi = self.ang_bounds
-        cp_target = cp_lo + (cp_hi - cp_lo) * jax.nn.sigmoid(x[:, 6:7])
-        ang_target = ang_lo + (ang_hi - ang_lo) * jax.nn.sigmoid(x[:, 7:8])
-        return jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
+        cp_targets = cp_lo + (cp_hi - cp_lo) * jax.nn.sigmoid(x[:, N_FACES : 2 * N_FACES])
+        ang_targets = ang_lo + (ang_hi - ang_lo) * jax.nn.sigmoid(x[:, 2 * N_FACES : 3 * N_FACES])
+        return jnp.concatenate([face_logits, cp_targets, ang_targets], axis=-1)
 
     def save_mlp_weights(self, filepath: Path, params: list[tuple[jnp.ndarray, jnp.ndarray]]) -> Path:
         """Save MLP weights, biases, and output limits for one training iteration."""
@@ -101,3 +101,48 @@ class MLP:
             arrays[f"layer_{layer_idx}_w"] = np.asarray(w)
             arrays[f"layer_{layer_idx}_b"] = np.asarray(b)
         np.savez(filepath, **arrays)
+
+
+class ActionSolver:
+    """Gurobi solver matching the training-time objective."""
+
+    def __init__(self):
+        self.env = gp.Env(empty=True)
+        self.env.setParam("OutputFlag", 0)
+        self.env.start()
+        self.model = gp.Model(env=self.env)
+        self.model.setParam("Threads", 1)
+        self.model.setParam("Presolve", 0)
+        self.xf = self.model.addVars(N_FACES, vtype=GRB.BINARY, name="xf")
+        self.cp = self.model.addVar(lb=_lo_cp, ub=_hi_cp, vtype=GRB.CONTINUOUS, name="cp")
+        self.ang = self.model.addVar(lb=_lo_ang, ub=_hi_ang, vtype=GRB.CONTINUOUS, name="ang")
+        self.model.addConstr(gp.quicksum(self.xf[i] for i in range(N_FACES)) == 1)
+        self.model.update()
+
+    def solve(self, c: np.ndarray) -> np.ndarray:
+        """Update objective from c (18,), solve, return x (8,)."""
+        if not np.all(np.isfinite(c)):
+            c = np.zeros(3 * N_FACES, dtype=np.float32)
+            c[N_FACES : 2 * N_FACES] = _mid_cp
+            c[2 * N_FACES : 3 * N_FACES] = _mid_ang
+        cp_targets = np.clip(c[N_FACES : 2 * N_FACES], _lo_cp, _hi_cp)
+        ang_targets = np.clip(c[2 * N_FACES : 3 * N_FACES], _lo_ang, _hi_ang)
+        face_obj = gp.quicksum(float(c[i]) * self.xf[i] for i in range(N_FACES))
+        cp_ref = gp.quicksum(float(cp_targets[i]) * self.xf[i] for i in range(N_FACES))
+        ang_ref = gp.quicksum(float(ang_targets[i]) * self.xf[i] for i in range(N_FACES))
+        cp_obj = CP_TARGET_WEIGHT * (self.cp - cp_ref) * (self.cp - cp_ref)
+        ang_obj = ANG_TARGET_WEIGHT * (self.ang - ang_ref) * (self.ang - ang_ref)
+        self.model.setObjective(face_obj + cp_obj + ang_obj, GRB.MINIMIZE)
+        self.model.update()
+        self.model.optimize()
+        face_vals = np.array([self.xf[i].X for i in range(N_FACES)], dtype=np.float32)
+        x = np.append(face_vals, [self.cp.X, self.ang.X]).astype(np.float32)
+        assert x.shape == (8,), f"x must be (8,), got {x.shape}"
+        return x
+
+    def solve_batch(self, c_batch: np.ndarray) -> np.ndarray:
+        """Solve the Gurobi objective for every env. Returns (N, 8)."""
+        out = np.zeros((c_batch.shape[0], 8), dtype=np.float32)
+        for i in range(c_batch.shape[0]):
+            out[i] = self.solve(c_batch[i])
+        return out
