@@ -58,6 +58,7 @@ System design (SurCo-prior):
 # Example usage:
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
 python scripts/main_surco_jm.py --n-envs 100 --random-t-pose
+python scripts/main_surco_jm.py --n-envs 16  --random-t-pose --verbosity 1 --record-video
 python scripts/main_surco_jm.py --n-envs 16 --verbosity 1 --record-video
 
 """
@@ -95,6 +96,7 @@ RANDOMZED_SMOOTHING_K = 20
 FACE_OUTPUT_REG_BETA = 0.01
 CP_TARGET_WEIGHT = 1.0
 ANG_TARGET_WEIGHT = 1.0
+RANDOM_T_POSE_EVAL_EVERY = 10
 
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
@@ -237,10 +239,13 @@ def plot_results(
     ax_delta.set_ylabel("Delta from Iter 1 [m]")
     ax_delta.grid(True, alpha=0.3)
 
-    for env_idx in range(min(n_envs, 7)):
-        ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}")
-        ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}")
-        ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}")
+    for env_idx in range(min(n_envs, 5)):
+        p1, _ = ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}", alpha=0.5)
+        ax_cp.scatter([cp[env_idx] for cp in cp_hist], color=p1.get_color())
+        p2, _ = ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}", alpha=0.5)
+        ax_ang.scatter([a[env_idx] for a in ang_hist], color=p2.get_color())
+        p3, _ = ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}", alpha=0.5)
+        ax_face.scatter([f[env_idx] for f in face_hist], color=p3.get_color())
 
     lo_cp, hi_cp = CONTACT_POINT_BOUNDS
     lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
@@ -287,6 +292,8 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
 
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
+    eval_t_pose_0 = env.t_poses[0].copy()
+    eval_target_pose_0 = env.target_poses[0].copy()
     now = datetime.now().strftime("%d__%H:%M:%S")
     save_dir = Path(f"logs/{now}__{problem_type}__n-envs:{n_envs}__SurCo-prior")
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -318,12 +325,14 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
 
         if verbosity > 0:
             face_idx = jnp.argmax(face_onehot, axis=-1)
+            jax.debug.print("rollout action")
             jax.debug.print(
-                "rollout action\n  face={face}\n  contact_point={cp}\n  angle={a}",
-                face=face_idx,
-                cp=contact_point,
-                a=angle,
+                "|__ face={face}\n  |__ contact_point={cp}\n  |__ angle={a}",
+            face=face_idx,
+            cp=contact_point,
+            a=angle,
             )
+            jax.debug.print("|__")
 
         # _, _, t_distances, jpos_traj = env.step_pure_soft(
         _, _, t_distances, jpos_traj = env.step_pure(
@@ -388,6 +397,14 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
 
         if random_t_pose:
             env.reset()
+            # Every N iterations, keep env 0 fixed as a consistent evaluation case
+            # while the rest of the batch stays randomized.
+            if (it + 1) % RANDOM_T_POSE_EVAL_EVERY == 0:
+                t_poses = env.t_poses
+                target_poses = env.target_poses
+                t_poses[0] = eval_t_pose_0
+                target_poses[0] = eval_target_pose_0
+                env.reset(target_poses=target_poses, t_poses=t_poses)
         else:
             env.reset(seed=RESET_SEED)
 

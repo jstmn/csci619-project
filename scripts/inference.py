@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import os
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +54,7 @@ def main(
     record_video: bool,
     save_dir: Path | None,
     verbosity: int,
+    n_planning_steps: int,
 ):
     mlp, params = load_checkpoint(checkpoint)
     solver = ActionSolver()
@@ -69,57 +69,63 @@ def main(
         timestamp = datetime.now().strftime("%d__%H:%M:%S")
         save_dir = Path(f"logs/{timestamp}__inference__n-envs:{n_envs}")
     save_dir.mkdir(parents=True, exist_ok=True)
+    jpos_traj_all = []
 
-    ctx = env.get_context_vector(env.data)
-    c = np.asarray(mlp.apply(params, ctx))
-    x_star = solver.solve_batch(c)
+    for i in range(n_planning_steps):
+        print(f"Running planning step {i + 1}/{n_planning_steps}")
+        ctx = env.get_context_vector(env.data)
+        c = np.asarray(mlp.apply(params, ctx))
+        x_star = solver.solve_batch(c)
 
-    face_onehot = x_star[:, :6]
-    face_idx = np.argmax(face_onehot, axis=-1)
-    contact_point = x_star[:, 6]
-    angle = x_star[:, 7]
+        face_onehot = x_star[:, :6]
+        face_idx = np.argmax(face_onehot, axis=-1)
+        contact_point = x_star[:, 6]
+        angle = x_star[:, 7]
 
-    print(f"Loaded checkpoint: {checkpoint}")
-    print(f"Running inference for n_envs={n_envs}")
-    print("Chosen actions:")
-    print(f"  face={face_idx.tolist()}")
-    print(f"  contact_point={np.asarray(contact_point).round(5).tolist()}")
-    print(f"  angle={np.asarray(angle).round(5).tolist()}")
+        print("Chosen actions:")
+        print(f"  face={face_idx.tolist()}")
+        print(f"  contact_point={np.asarray(contact_point).round(5).tolist()}")
+        print(f"  angle={np.asarray(angle).round(5).tolist()}")
 
-    if verbosity > 0:
-        for env_idx in range(n_envs):
-            print(f"\nEnv {env_idx}")
-            print(f"  context={np.asarray(ctx[env_idx]).round(5).tolist()}")
-            print(f"  {format_solver_params(c[env_idx])}")
+        if verbosity > 0:
+            for env_idx in range(n_envs):
+                print(f"\nEnv {env_idx}")
+                print(f"  context={np.asarray(ctx[env_idx]).round(5).tolist()}")
+                print(f"  {format_solver_params(c[env_idx])}")
 
-    _, _, t_distances, jpos_traj = env.step_pure(
-        data=env.data,
-        face=jnp.asarray(face_onehot),
-        contact_point=jnp.asarray(contact_point),
-        angle=jnp.asarray(angle),
-        n_sim_steps=N_SIM_STEPS,
-        check_t_displacement=False,
-    )
+        data_next, t_poses, t_distances, jpos_traj = env.step_pure(
+            data=env.data,
+            face=jnp.asarray(face_onehot),
+            contact_point=jnp.asarray(contact_point),
+            angle=jnp.asarray(angle),
+            n_sim_steps=N_SIM_STEPS,
+            check_t_displacement=False,
+        )
+        # Carry the pure rollout result forward so the next planning step starts
+        # from the newly reached state instead of the original reset state.
+        env._data = data_next
+        env._t_poses = np.asarray(t_poses[:, -1, :])
 
-    final_dists = np.asarray(t_distances[:, -1])
-    print(f"\nFinal distances={np.round(final_dists, 6).tolist()}")
-    print(f"Mean final distance={float(np.nanmean(final_dists)):.6f} [m]")
-    print(f"Std final distance={float(np.nanstd(final_dists)):.6f} [m]")
-
-    np.savez(
-        save_dir / "inference_outputs.npz",
-        context=np.asarray(ctx),
-        solver_params=np.asarray(c),
-        action=np.asarray(x_star),
-        final_distances=final_dists,
-    )
-    print(f"Saved outputs to {save_dir / 'inference_outputs.npz'}")
+        jpos_traj_all.append(np.asarray(jpos_traj))
+        final_dists = np.asarray(t_distances[:, -1])
+        print(f"\nFinal distances={np.round(final_dists, 6).tolist()}")
+        print(f"Mean final distance={float(np.nanmean(final_dists)):.6f} [m]")
+        print(f"Std final distance={float(np.nanstd(final_dists)):.6f} [m]")
 
     if record_video:
-        video_path = save_dir / "inference.mp4"
-        env.save_video_from_jpos_traj(video_path, np.asarray(jpos_traj))
+        video_path = save_dir / f"inference__{n_planning_steps}steps.mp4"
+        # Each rollout returns (nenvs, n_sim_steps, dofs). To visualize a
+        # multi-step plan, extend the time axis rather than the env axis.
+        env.save_video_from_jpos_traj(video_path, np.concatenate(jpos_traj_all, axis=1))
         print(f"Saved video to {video_path}")
+        os.system(f"xdg-open {save_dir}")
 
+""" Example usage:
+
+python scripts/inference.py \
+    --checkpoint logs/21__22:32:47__single_step__n-envs:16__SurCo-prior/checkpoints/mlp_iter_200.npz \
+    --n-envs 1 --random-t-pose --record-video --save-dir logs/21__22:32:47__single_step__n-envs:16__SurCo-prior/checkpoints/mlp_iter_200
+"""
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -130,6 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--save-dir", type=Path)
     parser.add_argument("--verbosity", type=int, default=0)
+    parser.add_argument("--n-planning-steps", type=int, default=10)
     args = parser.parse_args()
 
     assert args.n_envs > 0, "n_envs must be positive"
@@ -142,4 +149,5 @@ if __name__ == "__main__":
         record_video=args.record_video,
         save_dir=args.save_dir,
         verbosity=args.verbosity,
+        n_planning_steps=args.n_planning_steps,
     )
