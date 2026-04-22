@@ -3,10 +3,11 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-import jax.numpy as jnp
 import numpy as np
 
-from pusht619.core import PushTEnv
+import jax.numpy as jnp
+
+from pusht619.core import Action, PushTEnv
 from pusht619.models import MLP, ActionSolver
 
 
@@ -69,7 +70,6 @@ def main(
         timestamp = datetime.now().strftime("%d__%H:%M:%S")
         save_dir = Path(f"logs/{timestamp}__inference__n-envs:{n_envs}")
     save_dir.mkdir(parents=True, exist_ok=True)
-    jpos_traj_all = []
 
     for i in range(n_planning_steps):
         print(f"Running planning step {i + 1}/{n_planning_steps}")
@@ -93,30 +93,24 @@ def main(
                 print(f"  context={np.asarray(ctx[env_idx]).round(5).tolist()}")
                 print(f"  {format_solver_params(c[env_idx])}")
 
-        data_next, t_poses, t_distances, jpos_traj = env.step_pure(
-            data=env.data,
-            face=jnp.asarray(face_onehot),
-            contact_point=jnp.asarray(contact_point),
-            angle=jnp.asarray(angle),
+        action = Action(
+            face=face_idx.astype(np.int32).reshape(-1, 1),
+            contact_point=np.asarray(contact_point, dtype=np.float32).reshape(-1, 1),
+            angle=np.asarray(angle, dtype=np.float32).reshape(-1, 1),
+        )
+        result = env.step(
+            action=action,
             n_sim_steps=N_SIM_STEPS,
             check_t_displacement=False,
         )
-        # Carry the pure rollout result forward so the next planning step starts
-        # from the newly reached state instead of the original reset state.
-        env._data = data_next
-        env._t_poses = np.asarray(t_poses[:, -1, :])
-
-        jpos_traj_all.append(np.asarray(jpos_traj))
-        final_dists = np.asarray(t_distances[:, -1])
+        final_dists = np.asarray(result.t_distances[:, -1])
         print(f"\nFinal distances={np.round(final_dists, 6).tolist()}")
         print(f"Mean final distance={float(np.nanmean(final_dists)):.6f} [m]")
         print(f"Std final distance={float(np.nanstd(final_dists)):.6f} [m]")
 
     if record_video:
         video_path = save_dir / f"inference__{n_planning_steps}steps.mp4"
-        # Each rollout returns (nenvs, n_sim_steps, dofs). To visualize a
-        # multi-step plan, extend the time axis rather than the env axis.
-        env.save_video_from_jpos_traj(video_path, np.concatenate(jpos_traj_all, axis=1))
+        env.save_video(video_path)
         print(f"Saved video to {video_path}")
         os.system(f"xdg-open {save_dir}")
 
