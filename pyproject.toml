@@ -21,7 +21,8 @@ dependencies = [
     "mediapy",
     "imageio[ffmpeg]",
     "termcolor",
-    "gurobipy"
+    "gurobipy",
+    "tqdm"
 ]
 
 [project.optional-dependencies]

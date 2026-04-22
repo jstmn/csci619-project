@@ -79,7 +79,11 @@ class MLP:
         return params
 
     def apply(self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass. Returns bounded solver parameters in 8-D blocks."""
+        """Forward pass. Returns bounded solver parameters in 8-D blocks.
+
+        The continuous heads use a tanh-centered parameterization, so a zero
+        pre-activation maps to the midpoint of each valid range.
+        """
         for i, (w, b) in enumerate(params):
             x = x @ w + b
             if i < len(params) - 1:
@@ -90,8 +94,12 @@ class MLP:
         face_logits = x[:, :, :NUM_FACES]
         cp_lo, cp_hi = self.cp_bounds
         ang_lo, ang_hi = self.ang_bounds
-        cp_target = cp_lo + (cp_hi - cp_lo) * jax.nn.sigmoid(x[:, :, NUM_FACES : NUM_FACES + 1])
-        ang_target = ang_lo + (ang_hi - ang_lo) * jax.nn.sigmoid(x[:, :, NUM_FACES + 1 : NUM_FACES + 2])
+        cp_mid = 0.5 * (cp_lo + cp_hi)
+        cp_half_range = 0.5 * (cp_hi - cp_lo)
+        ang_mid = 0.5 * (ang_lo + ang_hi)
+        ang_half_range = 0.5 * (ang_hi - ang_lo)
+        cp_target = cp_mid + cp_half_range * jnp.tanh(x[:, :, NUM_FACES : NUM_FACES + 1])
+        ang_target = ang_mid + ang_half_range * jnp.tanh(x[:, :, NUM_FACES + 1 : NUM_FACES + 2])
         out = jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
         return out.reshape(out.shape[0], -1)
 

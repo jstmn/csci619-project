@@ -66,10 +66,12 @@ python scripts/main_surco_jm.py --n-envs 25  --random-t-pose --verbosity 1 --rec
 
 # Fixed t-pose
 python scripts/main_surco_jm.py --n-envs 25 --verbosity 1 --record-video
+python scripts/main_surco_jm.py --n-envs 1 --verbosity 2 --record-video
 python scripts/main_surco_jm.py --n-envs 25 --verbosity 1 --record-video --multi-step-n-actions 2
 """
 
 from __future__ import annotations
+import json
 import os
 from time import time
 
@@ -94,12 +96,13 @@ from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACE
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 N_OPT_STEPS = 500
-LR = 0.01
+LR = 0.05
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
 RANDOMZED_SMOOTHING_K = 20
-FACE_OUTPUT_REG_BETA = 0.01
+FACE_OUTPUT_REG_BETA = 0.05
+CONT_OUTPUT_REG_BETA = 0.005
 CP_TARGET_WEIGHT = 1.0
 ANG_TARGET_WEIGHT = 1.0
 RANDOM_T_POSE_EVAL_EVERY = 25
@@ -107,10 +110,14 @@ RANDOM_T_POSE_EVAL_EVERY = 25
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
 # Too large → x_k far from x*; gradient bias grows.
-PERTURB_LAMBDA = 0.75
+PERTURB_LAMBDA = 1.25
 
 
 _SOLVER = ActionSolver()
+_CP_MID = 0.5 * (CONTACT_POINT_BOUNDS[0] + CONTACT_POINT_BOUNDS[1])
+_ANG_MID = 0.5 * (float(ANGLE_BOUNDS[0]) + float(ANGLE_BOUNDS[1]))
+_CP_SCALE = CONTACT_POINT_BOUNDS[1] - CONTACT_POINT_BOUNDS[0]
+_ANG_SCALE = float(ANGLE_BOUNDS[1]) - float(ANGLE_BOUNDS[0])
 
 
 def _configure_solver(multi_step_n_actions: int | None) -> None:
@@ -211,8 +218,9 @@ def _milp_backward(res, grad_x):
 
         #
         if verbosity > 1:
-            jax.debug.print("\n  {k_i}", k_i=k_i)
+            jax.debug.print("  {k_i}", k_i=k_i)
             jax.debug.print("x_perturbed deltas")
+            jax.debug.print("|__ c_pert={c_pert}", c_pert=c_pert)
             jax.debug.print("|__ face_0={face_0}", face_0=face_0)
             jax.debug.print("|__ face_k={face_k}", face_k=face_k)
             jax.debug.print("|__ d_face={d_face}", d_face=face_k - face_0)
@@ -323,6 +331,19 @@ def plot_results(
         os.system(f"xdg-open {save_filepath}")
 
 
+def save_json(iteration_json_path, iteration, loss, mean_dist, final_dists_np, c_batch, x_batch, grad_c):
+    iteration_payload = {
+        "iteration": iteration,
+        "loss": float(loss),
+        "mean_final_distance": mean_dist,
+        "final_distance_per_env": final_dists_np.tolist(),
+        "c": np.asarray(c_batch).tolist(),
+        "x": x_batch.tolist(),
+        "dloss_dc": grad_c.tolist(),
+    }
+    iteration_json_path.write_text(json.dumps(iteration_payload, indent=2))
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -345,12 +366,14 @@ def main(
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
     solver_output_dim = ACTION_DIM * n_action_blocks
-    save_dir = Path(
-        f"logs/{now}__{effective_problem_type}__n-envs:{n_envs}__SurCo-prior__Adam__{solver_output_dim}dim__lr:{LR}__grad-clip:1.0__random-t-pose:{random_t_pose}"
-    )
+    random_pose_str = "random-t-pose" if random_t_pose else "fixed-t-pose"
+    multi_step_str = "multi-step" if is_multi_step else "single-step"
+    save_dir = Path(f"logs/{now}__n-envs:{n_envs}__lr:{LR}__{random_pose_str}__{multi_step_str}")
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir = save_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    iterations_dir = save_dir / "iterations"
+    iterations_dir.mkdir(parents=True, exist_ok=True)
     os.system(f"xdg-open {save_dir}")
 
     mlp = MLP(context_dim=9, hidden_dims=(128, 128), output_dim=solver_output_dim)
@@ -361,35 +384,31 @@ def main(
     )
     opt_state = optimizer.init(params)
 
-    def cost(params, data, rng_solve):
-        ctx = env.get_context_vector(data)  # (n_envs, 9)
-        c = mlp.apply(params, ctx)  # (n_envs, action_dim)
-
+    def cost_from_c(c, data, rng_solve, solver_verbosity: int, log_forward: bool):
         if verbosity > 1:
-            jax.debug.print(
-                "context  any_nan={n} min={lo:.3f} max={hi:.3f}",
-                n=jnp.any(jnp.isnan(ctx)),
-                lo=ctx.min(),
-                hi=ctx.max(),
-            )
+            pass
 
         # Do one clean forward solve/rollout. The only smoothing Monte Carlo lives
         # in milp_solver's custom VJP, where it estimates dL/dc.
-        x_star = milp_solver(c, rng_solve, verbosity)  # (n_envs, action_dim)
+        x_star = milp_solver(c, rng_solve, solver_verbosity)  # (n_envs, action_dim)
         x_star_blocks = x_star.reshape((x_star.shape[0], n_action_blocks, ACTION_DIM))
         c_blocks = c.reshape((c.shape[0], n_action_blocks, ACTION_DIM))
         face_weights = x_star_blocks[:, :, :NUM_FACES]
         contact_points = x_star_blocks[:, :, NUM_FACES]
         angles = x_star_blocks[:, :, NUM_FACES + 1]
 
-        if verbosity > 0:
+        if log_forward and verbosity > 0:
             face_idx = jnp.argmax(face_weights, axis=-1)
             jax.debug.print("rollout action")
             jax.debug.print(
-                "|__ face={face}\n  |__ contact_point={cp}\n  |__ angle={a}",
+                "|__ face={face}\n|__ contact_point (lims: {lo_cp:.3f}, {hi_cp:.3f})={cp}\n|__ angle (lims: {lo_ang:.3f}, {hi_ang:.3f})={a}",
                 face=face_idx,
                 cp=contact_points,
                 a=angles,
+                lo_cp=CONTACT_POINT_BOUNDS[0],
+                hi_cp=CONTACT_POINT_BOUNDS[1],
+                lo_ang=ANGLE_BOUNDS[0],
+                hi_ang=ANGLE_BOUNDS[1],
             )
             jax.debug.print("|__")
 
@@ -416,23 +435,41 @@ def main(
         # penalize them to keep smoothing effective. The per-face targets are
         # already bounded by the sigmoid head.
         c_reg = FACE_OUTPUT_REG_BETA * jnp.mean(jnp.square(c_blocks[:, :, :NUM_FACES]))
-        loss = task_loss + c_reg
+        cont_reg = CONT_OUTPUT_REG_BETA * jnp.mean(
+            jnp.square((contact_points - _CP_MID) / _CP_SCALE) + jnp.square((angles - _ANG_MID) / _ANG_SCALE)
+        )
+        loss = task_loss + c_reg + cont_reg
 
-        if verbosity > 0:
+        if log_forward and verbosity > 0:
             jax.debug.print(
-                "  sum(is_nan)={n} task_loss={task_loss:.6f} c_reg={c_reg:.6f}",
+                "  sum(is_nan)={n} task_loss={task_loss:.6f} c_reg={c_reg:.6f} cont_reg={cont_reg:.6f}",
                 n=jnp.sum(jnp.isnan(t_distances[:, -1])),
                 task_loss=task_loss,
                 c_reg=c_reg,
+                cont_reg=cont_reg,
             )
-        if verbosity > 1:
+        if log_forward and verbosity > 1:
             jax.debug.print("  final_dists={d}", d=t_distances[:, -1])
-        return loss, (t_distances, jpos_traj, face_weights, contact_points, angles)
+        return loss, (t_distances, jpos_traj, face_weights, contact_points, angles, c)
+
+    def cost(params, data, rng_solve):
+        ctx = env.get_context_vector(data)  # (n_envs, 9)
+        c = mlp.apply(params, ctx)  # (n_envs, action_dim)
+
+        if verbosity > 1:
+            jax.debug.print(
+                "context  any_nan={n} min={lo:.3f} max={hi:.3f}",
+                n=jnp.any(jnp.isnan(ctx)),
+                lo=ctx.min(),
+                hi=ctx.max(),
+            )
+        return cost_from_c(c, data, rng_solve, verbosity, True)
 
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
     # solve, so a JIT wrapper adds overhead without benefit. step_pure_soft is
     # already JIT'd internally, so physics stays compiled.
     cost_and_grad = jax.value_and_grad(cost, argnums=0, has_aux=True)
+    grad_loss_wrt_c = jax.grad(lambda c, data, rng_solve: cost_from_c(c, data, rng_solve, 0, False)[0], argnums=0)
 
     print("SurCo-prior: training NN  y → solver params  (Gurobi + randomized-smoothing VJP)")
     if n_envs < 16:
@@ -449,9 +486,10 @@ def main(
     ang_hist = []  # list of (n_envs,) float — angle per env per iter
 
     n_envs_better_0 = None
-    initial_mean_loss = None
+    initial_mean_dist = None
     initial_final_dists = None
     initial_faces = None
+    lowest_mean_dist = float("inf")
     t_start = time()
 
     for it in range(N_OPT_STEPS):
@@ -473,18 +511,29 @@ def main(
         t0 = time()
         env_data_0 = env.data
         step_key = jax.random.PRNGKey(it)
-        (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch)), g_raw = cost_and_grad(
+        (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch)), g_raw = cost_and_grad(
             params, env_data_0, step_key
         )
         final_dists_np = np.asarray(t_distances[:, -1])
+        initial_dists_np = np.asarray(t_distances[:, 0])
+        mean_dist = float(np.nanmean(final_dists_np))
         face_idx_np = np.asarray(jnp.argmax(face_weights, axis=-1))
         face_hist_current = face_idx_np[:, 0] if is_multi_step else face_idx_np
         cp_hist_current = np.asarray(cp_batch[:, 0] if is_multi_step else cp_batch)
         ang_hist_current = np.asarray(ang_batch[:, 0] if is_multi_step else ang_batch)
+        grad_c = np.asarray(grad_loss_wrt_c(c_batch, env_data_0, step_key))
         g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
         updates, opt_state = optimizer.update(g_params, opt_state, params)
         params = optax.apply_updates(params, updates)
         dt = time() - t0
+        x_batch = np.concatenate(
+            [
+                np.asarray(face_weights),
+                np.asarray(cp_batch)[..., None],
+                np.asarray(ang_batch)[..., None],
+            ],
+            axis=-1,
+        ).reshape(n_envs, -1)
 
         # Print NaN environments / gradients
         #
@@ -501,8 +550,8 @@ def main(
 
         # Print results
         #
-        if initial_mean_loss is None:
-            initial_mean_loss = loss
+        if initial_mean_dist is None:
+            initial_mean_dist = float(np.nanmean(initial_dists_np))
         if initial_final_dists is None:
             initial_final_dists = final_dists_np.copy()
         if initial_faces is None:
@@ -511,22 +560,26 @@ def main(
             if is_eval_step:
                 cprint(f"|____ eval step: using environment from iteration 0", "cyan")
         if n_envs_better_0 is None:
-            n_envs_better_0 = sum(final_dists_np < initial_mean_loss - 0.05)
-        delta_cm = 100 * (loss - initial_mean_loss)
+            n_envs_better_0 = sum(final_dists_np < initial_mean_dist - 0.05)
+        delta_cm = 100 * (mean_dist - initial_mean_dist)
         cprint(
-            f"|____ mean dist: {loss:.5f} [m] | delta from initial: {delta_cm:.3f} [cm] | initial mean: {initial_mean_loss:.5f} [m] | {dt * 1000:.1f} ms",
+            f"|____ mean dist: {mean_dist:.5f} [m] | delta from initial: {delta_cm:.3f} [cm] | initial mean @ t=0: {initial_mean_dist:.5f} [m] | {dt * 1000:.1f} ms",
             "green" if delta_cm < 0 else "red",
         )
-        n_envs_better = sum(final_dists_np < initial_mean_loss - 0.05)
+        n_envs_better = sum(final_dists_np < initial_mean_dist - 0.05)
         cprint(
             f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}",
             "green" if n_envs_better > n_envs_better_0 else "red",
         )
-        cprint(f"|____ face initial={initial_faces.tolist()}", "yellow")
-        cprint(f"|____ face current={face_idx_np.tolist()}", "yellow")
-        cprint(f"|____ face diff=   {(face_idx_np - initial_faces).tolist()}", "yellow")
-        cprint(f"|____ angles=      {ang_hist_current.tolist()}", "yellow")
-        cprint(f"|____ cp=          {cp_hist_current.tolist()}", "yellow")
+        cprint(f"|____ face initial= {initial_faces.tolist()}", "yellow")
+        cprint(f"|____ face current= {face_idx_np.tolist()}", "yellow")
+        cprint(f"|____ face diff=    {(face_idx_np - initial_faces).tolist()}", "yellow")
+        cprint(f"|____ angles=       {ang_hist_current.tolist()}", "yellow")
+        cprint(f"|____ contact-point={cp_hist_current.tolist()}", "yellow")
+        if verbosity > 1:
+            cprint(f"|____ c=           {np.asarray(c_batch).tolist()}", "yellow")
+            cprint(f"|____ dloss/dc=    {grad_c.tolist()}", "yellow")
+        save_json(iterations_dir / f"{it:03d}.json", it, loss, mean_dist, final_dists_np, c_batch, x_batch, grad_c)
 
         # Print gradient statistics
         #
@@ -566,6 +619,13 @@ def main(
                 save_filepath=save_dir / f"{it + 1:03d}.png",
                 open_after_save=False,
             )
+        if mean_dist < lowest_mean_dist:
+            lowest_mean_dist = mean_dist
+            cprint(f"New lowest mean dist: {lowest_mean_dist:.5f} [m]", "green")
+            filepath = checkpoints_dir / f"mlp_lowest_mean_dist.npz"
+            mlp.save_mlp_weights(filepath, params)
+            save_json(iterations_dir / f"optimal.json", it, loss, mean_dist, final_dists_np, c_batch, x_batch, grad_c)
+
 
         # Save video
         #
@@ -608,5 +668,10 @@ if __name__ == "__main__":
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     assert args.n_envs is not None, "n_envs must be specified"
     main(
-        args.problem_type, args.n_envs, args.verbosity, args.random_t_pose, args.record_video, args.multi_step_n_actions
+        problem_type=args.problem_type,
+        n_envs=args.n_envs,
+        verbosity=args.verbosity,
+        random_t_pose=args.random_t_pose,
+        record_video=args.record_video,
+        multi_step_n_actions=args.multi_step_n_actions,
     )

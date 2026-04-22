@@ -817,8 +817,8 @@ class PushTEnv:
                 model=self._mj_multi_model,
                 data=self._mj_multi_data,
                 fps=int(1 / self._model.time_step / 12),
-                width=2500,
-                height=2500,
+                width=2512,
+                height=2512
             )
 
     @property
