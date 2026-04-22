@@ -55,19 +55,18 @@ System design (SurCo-prior):
    VJP to estimate gradients through the combinatorial solve before the NN.
 
 
-Run:
-    python scripts/main_surco_jm.py --random-t-pose --verbosity 1
-    python scripts/main_surco_jm.py --verbosity 1 --record-video --n-envs 9
+# Example usage:
+python scripts/main_surco_jm.py --n-envs 16 --random-t-pose --verbosity 1
+python scripts/main_surco_jm.py --n-envs 25 --verbosity 1 --record-video
 """
 
 from __future__ import annotations
-
+import os
 from time import time
 
 PROGRAM_START_TIME = time()
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
 
 import matplotlib.pyplot as plt
 from termcolor import cprint
@@ -80,12 +79,13 @@ import argparse
 import gurobipy as gp
 from gurobipy import GRB
 
+from pusht619.models import MLP
 from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-N_OPT_STEPS = 50
+N_OPT_STEPS = 25
 LR = 0.1
 N_SIM_STEPS = 50
 RESET_SEED = 0
@@ -209,6 +209,10 @@ def _milp_backward(res, grad_x):
         jax.debug.print("  c={c}", c=c)
         jax.debug.print("\n")
 
+    angle_0 = _x_star[:, 7]
+    contact_point_0 = _x_star[:, 6]
+    face_0 = jnp.argmax(_x_star[:, :N_FACES], axis=-1)
+
     #
     for k_i in range(RANDOMZED_SMOOTHING_K):
         key, subkey = jax.random.split(key)
@@ -218,13 +222,11 @@ def _milp_backward(res, grad_x):
         face_k = jnp.argmax(x_k[:, :N_FACES], axis=-1)
         if verbosity > 0:
             jax.debug.print("\n  {k_i}", k_i=k_i)
-            jax.debug.print("       c_pert={c_pert}", c_pert=c_pert)
-            jax.debug.print(
-                "       x_perturbed face={face} contact_point={cp} angle={a}",
-                face=face_k,
-                cp=x_k[:, 6],
-                a=x_k[:, 7]
-            )
+            # jax.debug.print("c_perturbed={c_pert}", c_pert=c_pert)
+            jax.debug.print("x_perturbed deltas")
+            jax.debug.print("|__ face={delta_face}", delta_face=face_k - face_0)
+            jax.debug.print("|__ cp=  {delta_cp}", delta_cp=x_k[:, 6] - contact_point_0)
+            jax.debug.print("|__ a=   {delta_a}", delta_a=x_k[:, 7] - angle_0)
         inner = jnp.sum(grad_x_safe * x_k, axis=-1, keepdims=True)  # (N, 1)
         grad_c = grad_c + eps * inner
     grad_c = grad_c / (RANDOMZED_SMOOTHING_K * PERTURB_LAMBDA)
@@ -234,42 +236,6 @@ def _milp_backward(res, grad_x):
 milp_solver.defvjp(_milp_forward, _milp_backward)
 
 
-# ── MLP: y → c ────────────────────────────────────────────────────────────────
-
-
-class MLP:
-    """Maps context y (dim=11) → solver parameters c (dim=8).
-
-    c[:6] = face cost coefficients
-    c[6]  = contact_point target, squashed into CONTACT_POINT_BOUNDS
-    c[7]  = angle target, squashed into ANGLE_BOUNDS
-
-    Params: list of (W, b) tuples — plain JAX pytree, jit/grad compatible.
-    """
-
-    def __init__(self, context_dim: int, hidden_dims: Sequence[int] = (64, 64)):
-        self.layer_sizes = [context_dim, *hidden_dims, 8]
-
-    def init(self, key: jax.Array) -> list[tuple[jnp.ndarray, jnp.ndarray]]:
-        params = []
-        for i in range(len(self.layer_sizes) - 1):
-            key, subkey = jax.random.split(key)
-            fan_in, fan_out = self.layer_sizes[i], self.layer_sizes[i + 1]
-            w = jax.random.normal(subkey, (fan_in, fan_out), dtype=jnp.float32) * jnp.sqrt(2.0 / fan_in)
-            b = jnp.zeros(fan_out, dtype=jnp.float32)
-            params.append((w, b))
-        return params
-
-    def apply(self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass. Returns face logits plus bounded continuous targets."""
-        for i, (w, b) in enumerate(params):
-            x = x @ w + b
-            if i < len(params) - 1:
-                x = jax.nn.relu(x)
-        face_logits = x[:, :N_FACES]
-        cp_target = _lo_cp + (_hi_cp - _lo_cp) * jax.nn.sigmoid(x[:, 6:7])
-        ang_target = _lo_ang + (_hi_ang - _lo_ang) * jax.nn.sigmoid(x[:, 7:8])
-        return jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
 
 
 
@@ -301,7 +267,7 @@ def plot_results(save_dir, means, stds, face_hist, cp_hist, ang_hist, n_envs, n_
     ax_std.set_ylabel("Std [m]")
     ax_std.grid(True, alpha=0.3)
 
-    for env_idx in range(min(n_envs, 3)):
+    for env_idx in range(min(n_envs, 7)):
         ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}")
         ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}")
         ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}")
@@ -337,6 +303,7 @@ def plot_results(save_dir, means, stds, face_hist, cp_hist, ang_hist, n_envs, n_
     print(f"Saved plot to {save_filepath}")
     print(f"xdg-open {save_filepath}")
     plt.close()
+    os.system(f"xdg-open {save_filepath}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -349,8 +316,10 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
-    save_dir = Path(f"videos/{now}__{problem_type}__SurCo-prior")
+    save_dir = Path(f"logs/{now}__{problem_type}__n-envs:{n_envs}__SurCo-prior")
     save_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir = save_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     mlp = MLP(context_dim=11, hidden_dims=(128, 128))
     params = mlp.init(jax.random.PRNGKey(0))
@@ -425,6 +394,7 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
     cp_hist = []  # list of (n_envs,) float — contact_point per env per iter
     ang_hist = []  # list of (n_envs,) float — angle per env per iter
 
+    n_envs_better_0 = None
     initial_mean_dist = None
     t_start = time()
 
@@ -447,27 +417,45 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
             params, env_data_0, step_key
         )
         final_dists_np = np.asarray(t_distances[:, -1])
-        n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for layer in g_raw for x in layer)
         g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
         params = jax.tree.map(lambda p, g: p - LR * g, params, g_params)
         dt = time() - t0
 
-        if initial_mean_dist is None:
-            initial_mean_dist = loss
-
-
+        # Print NaN environments / gradients
+        #
+        nan_envs = np.where(np.isnan(final_dists_np))[0].tolist()
+        if nan_envs:
+            for env_idx in nan_envs:
+                cprint(f"  Env: {env_idx} - T distance is NaN", "red")
+        n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for layer in g_raw for x in layer)
         if n_bad_grads > 0:
             cprint(
                 f"WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).",
                 "red",
             )
 
-        delta_cm = 100 * (loss - initial_mean_dist)
-        color = "green" if delta_cm < 0 else "red"
-        cprint(f"|____ mean dist: {loss:.6f} [m] | delta from initial: {delta_cm:.4f} [cm] | {dt * 1000:.1f} ms", color)
-        n_envs_better = sum(final_dists_np < initial_mean_dist - 0.05)
-        cprint(f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean", "yellow")
 
+        # Save weights
+        # 
+        if (it + 1) % 5 == 0:
+            filepath = checkpoints_dir / f"mlp_iter_{it + 1:03d}.npz"
+            mlp.save_mlp_weights(filepath, params)
+            cprint(f"|____ saved weights to {filepath}", "yellow")
+
+
+        # Print results
+        #
+        if initial_mean_dist is None:
+            initial_mean_dist = loss
+        if n_envs_better_0 is None:
+            n_envs_better_0 = sum(final_dists_np < initial_mean_dist - 0.05)
+        delta_cm = 100 * (loss - initial_mean_dist)
+        cprint(f"|____ mean dist: {loss:.5f} [m] | delta from initial: {delta_cm:.3f} [cm] | initial mean: {initial_mean_dist:.5f} [m] | {dt * 1000:.1f} ms", "green" if delta_cm < 0 else "red")
+        n_envs_better = sum(final_dists_np < initial_mean_dist - 0.05)
+        cprint(f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}", "green" if n_envs_better > n_envs_better_0 else "red")
+
+        # Print gradient statistics
+        #
         if verbosity > 0:
             grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
@@ -475,21 +463,20 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
             std_change = jnp.std(jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
             cprint(f"|____ max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}", "yellow")
 
+        # Log results for plotting
+        #
         means.append(float(np.nanmean(final_dists_np)))
         stds.append(float(np.nanstd(final_dists_np)))
         face_hist.append(np.asarray(jnp.argmax(face_onehot, axis=-1)))  # (n_envs,)
         cp_hist.append(np.asarray(cp_batch))
         ang_hist.append(np.asarray(ang_batch))
 
+        # Save video
+        #
         if record_video:
             save_filepath = save_dir / f"{it:03d}.mp4"
             env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
             cprint(f"  Saved video to {save_filepath}", "green")
-
-        nan_envs = np.where(np.isnan(final_dists_np))[0].tolist()
-        if nan_envs:
-            for env_idx in nan_envs:
-                cprint(f"  Env: {env_idx} - T distance is NaN", "red")
 
         if it == 0:
             cprint(f"First iteration time: {time() - t_start:.2f} s", "yellow")
@@ -508,5 +495,7 @@ if __name__ == "__main__":
     parser.add_argument("--random-t-pose", action="store_true", help="Randomize problem instances each iteration")
     parser.add_argument("--record-video", action="store_true")
     args = parser.parse_args()
-    VERBOSITY = args.verbosity
+    assert args.problem_type in ["single_step"], "Only single step problem is supported for now."
+    assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
+    assert args.n_envs is not None, "n_envs must be specified"
     main(args.problem_type, args.n_envs, args.verbosity, args.random_t_pose, args.record_video)
