@@ -51,17 +51,17 @@ _mid_ang = 0.5 * (_lo_ang + _hi_ang)
 # ── MLP: y → c ────────────────────────────────────────────────────────────────
 
 class MLP:
-    """Maps context y (dim=11) → solver parameters c.
+    """Maps context y → solver parameters c.
 
-    c[:6]    = face cost coefficients
-    c[6:12]  = per-face contact_point targets, squashed into CONTACT_POINT_BOUNDS
-    c[12:18] = per-face angle targets, squashed into ANGLE_BOUNDS
+    c[:6]  = face cost coefficients (logits)
+    c[6]   = shared contact_point target, squashed into CONTACT_POINT_BOUNDS
+    c[7]   = shared angle target, squashed into ANGLE_BOUNDS
 
     Params: list of (W, b) tuples — plain JAX pytree, jit/grad compatible.
     """
 
     def __init__(self, context_dim: int, hidden_dims: Sequence[int] = (128, 128)):
-        self.layer_sizes = [context_dim, *hidden_dims, 3 * N_FACES]
+        self.layer_sizes = [context_dim, *hidden_dims, N_FACES + 2]
         self.cp_bounds = (_lo_cp, _hi_cp)
         self.ang_bounds = (_lo_ang, _hi_ang)
 
@@ -84,9 +84,9 @@ class MLP:
         face_logits = x[:, :N_FACES]
         cp_lo, cp_hi = self.cp_bounds
         ang_lo, ang_hi = self.ang_bounds
-        cp_targets = cp_lo + (cp_hi - cp_lo) * jax.nn.sigmoid(x[:, N_FACES : 2 * N_FACES])
-        ang_targets = ang_lo + (ang_hi - ang_lo) * jax.nn.sigmoid(x[:, 2 * N_FACES : 3 * N_FACES])
-        return jnp.concatenate([face_logits, cp_targets, ang_targets], axis=-1)
+        cp_target = cp_lo + (cp_hi - cp_lo) * jax.nn.sigmoid(x[:, N_FACES : N_FACES + 1])
+        ang_target = ang_lo + (ang_hi - ang_lo) * jax.nn.sigmoid(x[:, N_FACES + 1 : N_FACES + 2])
+        return jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
 
     def save_mlp_weights(self, filepath: Path, params: list[tuple[jnp.ndarray, jnp.ndarray]]) -> Path:
         """Save MLP weights, biases, and output limits for one training iteration."""
@@ -120,16 +120,14 @@ class ActionSolver:
         self.model.update()
 
     def solve(self, c: np.ndarray) -> np.ndarray:
-        """Update objective from c (18,), solve, return x (8,)."""
+        """Update objective from c (8,), solve, return x (8,)."""
         if not np.all(np.isfinite(c)):
-            c = np.zeros(3 * N_FACES, dtype=np.float32)
-            c[N_FACES : 2 * N_FACES] = _mid_cp
-            c[2 * N_FACES : 3 * N_FACES] = _mid_ang
-        cp_targets = np.clip(c[N_FACES : 2 * N_FACES], _lo_cp, _hi_cp)
-        ang_targets = np.clip(c[2 * N_FACES : 3 * N_FACES], _lo_ang, _hi_ang)
+            c = np.zeros(N_FACES + 2, dtype=np.float32)
+            c[N_FACES] = _mid_cp
+            c[N_FACES + 1] = _mid_ang
+        cp_ref = float(np.clip(c[N_FACES], _lo_cp, _hi_cp))
+        ang_ref = float(np.clip(c[N_FACES + 1], _lo_ang, _hi_ang))
         face_obj = gp.quicksum(float(c[i]) * self.xf[i] for i in range(N_FACES))
-        cp_ref = gp.quicksum(float(cp_targets[i]) * self.xf[i] for i in range(N_FACES))
-        ang_ref = gp.quicksum(float(ang_targets[i]) * self.xf[i] for i in range(N_FACES))
         cp_obj = CP_TARGET_WEIGHT * (self.cp - cp_ref) * (self.cp - cp_ref)
         ang_obj = ANG_TARGET_WEIGHT * (self.ang - ang_ref) * (self.ang - ang_ref)
         self.model.setObjective(face_obj + cp_obj + ang_obj, GRB.MINIMIZE)

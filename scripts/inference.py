@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 import jax.numpy as jnp
 
@@ -17,7 +18,7 @@ RESET_SEED = 0
 def load_checkpoint(checkpoint_path: Path) -> tuple[MLP, list[tuple[jnp.ndarray, jnp.ndarray]]]:
     checkpoint = np.load(checkpoint_path)
     layer_sizes = checkpoint["layer_sizes"].astype(np.int32).tolist()
-    assert layer_sizes[0] == 11, f"Expected context dim 11, got {layer_sizes[0]}"
+    # assert layer_sizes[0] == 11, f"Expected context dim 11, got {layer_sizes[0]}"
     hidden_dims = tuple(layer_sizes[1:-1])
     mlp = MLP(context_dim=layer_sizes[0], hidden_dims=hidden_dims)
 
@@ -71,6 +72,8 @@ def main(
         save_dir = Path(f"logs/{timestamp}__inference__n-envs:{n_envs}")
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    all_distances = []  # list of (n_envs, N_SIM_STEPS+1) arrays
+
     for i in range(n_planning_steps):
         print(f"Running planning step {i + 1}/{n_planning_steps}")
         ctx = env.get_context_vector(env.data)
@@ -102,22 +105,49 @@ def main(
             n_sim_steps=N_SIM_STEPS,
             check_t_displacement=False,
         )
-        final_dists = np.asarray(result.t_distances[:, -1])
+        t_distances = np.asarray(result.t_distances)  # (n_envs, N_SIM_STEPS+1)
+        all_distances.append(t_distances)
+        final_dists = t_distances[:, -1]
         print(f"\nFinal distances={np.round(final_dists, 6).tolist()}")
         print(f"Mean final distance={float(np.nanmean(final_dists)):.6f} [m]")
         # print(f"Std final distance={float(np.nanstd(final_dists)):.6f} [m]")
 
+    # ── Distance plot ──────────────────────────────────────────────────────────
+    # Concatenate across planning steps: (n_envs, total_timesteps)
+    dist_all = np.concatenate(all_distances, axis=1)
+    timesteps = np.arange(dist_all.shape[1])
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    for env_idx in range(n_envs):
+        ax.plot(timesteps, dist_all[env_idx], alpha=0.4, linewidth=0.8)
+    ax.plot(timesteps, np.nanmean(dist_all, axis=0), color="black", linewidth=2.0, label="mean")
+    for step in range(1, n_planning_steps):
+        ax.axvline(step * (N_SIM_STEPS + 1), color="gray", linestyle="--", linewidth=0.6)
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Distance [m]")
+    ax.set_title(f"T distance over time  (n_envs={n_envs}, n_planning_steps={n_planning_steps})")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    video_path = save_dir / f"inference__n-steps:{n_planning_steps}__n-envs:{n_envs}.mp4"
+    plot_path = str(video_path).replace(".mp4", ".png")
+    plt.savefig(plot_path, bbox_inches="tight", dpi=150)
+    plt.close()
+    print(f"Saved distance plot to {plot_path}")
+    os.system(f"xdg-open {plot_path}")
+
     if record_video:
-        video_path = save_dir / f"inference__n-steps:{n_planning_steps}__n-envs:{n_envs}.mp4"
         env.save_video(video_path)
         print(f"Saved video to {video_path}")
         os.system(f"xdg-open {save_dir}")
 
 """ Example usage:
 
-python scripts/inference.py \
-    --checkpoint logs/21__22:32:47__single_step__n-envs:16__SurCo-prior/checkpoints/mlp_iter_200.npz \
-    --n-envs 4 --random-t-pose --record-video --save-dir logs/21__22:32:47__single_step__n-envs:16__SurCo-prior/checkpoints/mlp_iter_200
+CKPT=logs/22__00:59:01__single_step__n-envs:64__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_1000.npz
+CKPT=logs/22__01:03:11__single_step__n-envs:64__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_1000.npz
+CKPT=logs/22__01:08:13__single_step__n-envs:16__SurCo-prior__Adam__8dim__lr:0.01__grad-clip:1.0/checkpoints/mlp_iter_1000.npz
+
+python scripts/inference.py --checkpoint ${CKPT} --n-envs 16 --random-t-pose --record-video
 """
 
 if __name__ == "__main__":
@@ -127,11 +157,14 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=RESET_SEED)
     parser.add_argument("--random-t-pose", action="store_true", help="Use a random reset instead of a fixed seed")
     parser.add_argument("--record-video", action="store_true")
-    parser.add_argument("--save-dir", type=Path)
     parser.add_argument("--verbosity", type=int, default=0)
     parser.add_argument("--n-planning-steps", type=int, default=10)
     args = parser.parse_args()
 
+    save_dir = str(args.checkpoint).replace(".npz", "")
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    os.system(f"xdg-open {save_dir}")
     assert args.n_envs > 0, "n_envs must be positive"
     assert args.verbosity in [0, 1, 2], "verbosity must be 0, 1, or 2"
     main(
@@ -140,7 +173,7 @@ if __name__ == "__main__":
         seed=args.seed,
         random_t_pose=args.random_t_pose,
         record_video=args.record_video,
-        save_dir=args.save_dir,
+        save_dir=save_dir,
         verbosity=args.verbosity,
         n_planning_steps=args.n_planning_steps,
     )

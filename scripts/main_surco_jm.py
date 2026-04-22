@@ -59,7 +59,8 @@ System design (SurCo-prior):
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
 python scripts/main_surco_jm.py --n-envs 100 --random-t-pose
 python scripts/main_surco_jm.py --n-envs 64 --random-t-pose
-python scripts/main_surco_jm.py --n-envs 16  --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco_jm.py --n-envs 16 --random-t-pose
+python scripts/main_surco_jm.py --n-envs 64  --random-t-pose --verbosity 1 --record-video
 python scripts/main_surco_jm.py --n-envs 16 --verbosity 1 --record-video
 
 """
@@ -81,28 +82,29 @@ import jax.numpy as jnp
 import numpy as np
 import argparse
 
+import optax
 from pusht619.models import MLP, ActionSolver
 from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-N_OPT_STEPS = 200
-LR = 0.1
+N_OPT_STEPS = 1000
+LR = 0.01
 N_SIM_STEPS = 50
 RESET_SEED = 0
 N_FACES = 6
-RANDOMZED_SMOOTHING_K = 30
+RANDOMZED_SMOOTHING_K = 20
 # RANDOMZED_SMOOTHING_K = 10
 FACE_OUTPUT_REG_BETA = 0.01
 CP_TARGET_WEIGHT = 1.0
 ANG_TARGET_WEIGHT = 1.0
-RANDOM_T_POSE_EVAL_EVERY = 10
+RANDOM_T_POSE_EVAL_EVERY = 25
 
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
 # Too large → x_k far from x*; gradient bias grows.
-PERTURB_LAMBDA = 3.0
+PERTURB_LAMBDA = 1.5
 
 
 _SOLVER = ActionSolver()
@@ -114,7 +116,7 @@ def _gurobi_solve_batch(c_batch: np.ndarray) -> np.ndarray:
 
 
 def _solve_milp_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
-    """Forward-only JAX wrapper around _gurobi_solve_batch. c: (N,18) → x: (N,8)."""
+    """Forward-only JAX wrapper around _gurobi_solve_batch. c: (N,8) → x: (N,8)."""
     c = c.astype(jnp.float32)
     shape = jax.ShapeDtypeStruct((c.shape[0], 8), jnp.float32)
     return jax.pure_callback(
@@ -126,7 +128,7 @@ def _solve_milp_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
 
 @jax.custom_vjp
 def milp_solver(c: jnp.ndarray, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray:
-    """Differentiable Gurobi solve: c (N,18) → x_star (N,8).
+    """Differentiable Gurobi solve: c (N,8) → x_star (N,8).
 
     Backward (Berthet et al. 2020): Monte Carlo over K_in = RANDOMZED_SMOOTHING_K draws
         ε_j ~ N(0, I),  x_j = solve(c + λ ε_j)
@@ -148,10 +150,15 @@ def _milp_forward(c, rng, verbosity):
 def _milp_backward(res, grad_x):
     c, _x_star, sample_rng, verbosity = res
     grad_x_safe = jnp.where(jnp.isfinite(grad_x), grad_x, 0.0).astype(jnp.float32)
-    grad_c = jnp.zeros_like(c)
+
+    # Direct gradient for continuous outputs: x_star[6] = cp_target and
+    # x_star[7] = ang_target (Gurobi minimizes (cp - cp_target)^2, so the
+    # optimum is cp_opt = cp_target when feasible → d(x_opt)/d(target) = 1).
+    grad_c_continuous = grad_x_safe[:, 6:8]
+
+    # Randomized-smoothing estimator for face logits only.
+    grad_c_face = jnp.zeros_like(c[:, :N_FACES])
     key = sample_rng
-    # Randomized-smoothing estimator for dL/dc: solve the perturbed objective K times
-    # at c + lambda * eps_j, then average their contributions to the VJP.
     if verbosity > 0:
         jax.debug.print("  c={c}", c=c)
         jax.debug.print("\n")
@@ -160,25 +167,26 @@ def _milp_backward(res, grad_x):
     contact_point_0 = _x_star[:, 6]
     face_0 = jnp.argmax(_x_star[:, :N_FACES], axis=-1)
 
-    #
     for k_i in range(RANDOMZED_SMOOTHING_K):
         key, subkey = jax.random.split(key)
-        eps = jax.random.normal(subkey, c.shape, dtype=jnp.float32)
-        c_pert = (c + PERTURB_LAMBDA * eps).astype(jnp.float32)
+        eps_face = jax.random.normal(subkey, (c.shape[0], N_FACES), dtype=jnp.float32)
+        c_pert = c.at[:, :N_FACES].add(PERTURB_LAMBDA * eps_face).astype(jnp.float32)
         x_k = _solve_milp_pure_callback(c_pert)
         face_k = jnp.argmax(x_k[:, :N_FACES], axis=-1)
-        if verbosity > 0:
+        inner = jnp.sum(grad_x_safe[:, :N_FACES] * x_k[:, :N_FACES], axis=-1, keepdims=True)  # (N, 1)
+        grad_c_face = grad_c_face + eps_face * inner
+
+        #
+        if verbosity > 1:
             jax.debug.print("\n  {k_i}", k_i=k_i)
-            # jax.debug.print("c_perturbed={c_pert}", c_pert=c_pert)
             jax.debug.print("x_perturbed deltas")
             jax.debug.print("|__ face_0={face_0}", face_0=face_0)
             jax.debug.print("|__ face_k={face_k}", face_k=face_k)
             jax.debug.print("|__ d_face={d_face}", d_face=face_k - face_0)
             jax.debug.print("|__ cp=    {delta_cp}", delta_cp=x_k[:, 6] - contact_point_0)
             jax.debug.print("|__ a=     {delta_a}", delta_a=x_k[:, 7] - angle_0)
-        inner = jnp.sum(grad_x_safe * x_k, axis=-1, keepdims=True)  # (N, 1)
-        grad_c = grad_c + eps * inner
-    grad_c = grad_c / (RANDOMZED_SMOOTHING_K * PERTURB_LAMBDA)
+    grad_c_face = grad_c_face / (RANDOMZED_SMOOTHING_K * PERTURB_LAMBDA)
+    grad_c = jnp.concatenate([grad_c_face, grad_c_continuous], axis=-1)
     return (grad_c, None, None)
 
 
@@ -295,7 +303,7 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
-    save_dir = Path(f"logs/{now}__{problem_type}__n-envs:{n_envs}__SurCo-prior")
+    save_dir = Path(f"logs/{now}__{problem_type}__n-envs:{n_envs}__SurCo-prior__Adam__8dim__lr:{LR}__grad-clip:1.0")
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir = save_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -303,6 +311,11 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
 
     mlp = MLP(context_dim=9, hidden_dims=(128, 128))
     params = mlp.init(jax.random.PRNGKey(0))
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(LR),
+    )
+    opt_state = optimizer.init(params)
 
     def cost(params, data, rng_solve):
         ctx = env.get_context_vector(data)  # (n_envs, 9)
@@ -413,7 +426,8 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
         final_dists_np = np.asarray(t_distances[:, -1])
         face_idx_np = np.asarray(jnp.argmax(face_onehot, axis=-1))
         g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
-        params = jax.tree.map(lambda p, g: p - LR * g, params, g_params)
+        updates, opt_state = optimizer.update(g_params, opt_state, params)
+        params = optax.apply_updates(params, updates)
         dt = time() - t0
 
         # Print NaN environments / gradients
@@ -441,7 +455,6 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
         if random_t_pose:
             if is_eval_step:
                 cprint(f"|____ eval step: using environment from iteration 0", "cyan")
-            cprint(f"|____ mean dist: {loss:.5f} [m] | {dt * 1000:.1f} ms", "green" if loss < initial_mean_loss else "red")
         if n_envs_better_0 is None:
             n_envs_better_0 = sum(final_dists_np < initial_mean_loss - 0.05)
         delta_cm = 100 * (loss - initial_mean_loss)
@@ -457,9 +470,8 @@ def main(problem_type: str, n_envs: int, verbosity: int, random_t_pose: bool, re
         if verbosity > 0:
             grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
-            mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
-            std_change = jnp.std(jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
-            cprint(f"|____ max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}", "yellow")
+            mean_grad = jnp.mean(jnp.array([jnp.mean(g).item() for g in grad_abs_values]))
+            cprint(f"|____ max |grad|: {max_grad:.6f}, mean |grad|: {mean_grad:.6f}", "yellow")
 
         # Log results for plotting
         #
