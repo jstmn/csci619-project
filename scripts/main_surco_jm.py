@@ -63,11 +63,13 @@ python scripts/main_surco_jm.py --n-envs 100 --random-t-pose
 python scripts/main_surco_jm.py --n-envs 64 --random-t-pose
 python scripts/main_surco_jm.py --n-envs 16 --random-t-pose
 python scripts/main_surco_jm.py --n-envs 25  --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco_jm.py --n-envs 25 --random-t-pose --verbosity 1 --record-video --multi-step-n-actions 2
+
 
 # Fixed t-pose
 python scripts/main_surco_jm.py --n-envs 25 --verbosity 1 --record-video
 python scripts/main_surco_jm.py --n-envs 1 --verbosity 2 --record-video
-python scripts/main_surco_jm.py --n-envs 25 --verbosity 1 --record-video --multi-step-n-actions 2
+python scripts/main_surco_jm.py --n-envs 1 --verbosity 1 --record-video --multi-step-n-actions 2 --disable-random
 """
 
 from __future__ import annotations
@@ -87,20 +89,22 @@ jax.config.update("jax_compilation_cache_dir", str(Path.home() / ".cache/jax_pus
 import jax.numpy as jnp
 import numpy as np
 import argparse
+from tqdm.auto import tqdm  # pyright: ignore[reportMissingModuleSource]
 
 import optax
 from pusht619.models import MLP, ActionSolver, ActionSolverMultiStep
-from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES
+from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES
 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-N_OPT_STEPS = 500
-LR = 0.05
+N_OPT_STEPS = 250
+LR = 0.01
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
 RANDOMZED_SMOOTHING_K = 20
+RANDOM_ACTION_SAMPLE_K = 5
 FACE_OUTPUT_REG_BETA = 0.05
 CONT_OUTPUT_REG_BETA = 0.005
 CP_TARGET_WEIGHT = 1.0
@@ -246,10 +250,15 @@ def plot_results(
     n_sim_steps,
     n_opt_steps,
     random_t_pose,
+    random_means=None,
+    random_stds=None,
     save_filepath=None,
+    save_filepath2=None,
     open_after_save=False,
 ):
     initial_mean_loss = means[0]
+    x_iters = np.arange(len(means))
+    has_random_baseline = random_means is not None and random_stds is not None
     fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  n_sim_steps={n_sim_steps}  "
@@ -261,14 +270,26 @@ def plot_results(
     ax_face, ax_delta = axes[2, 0], axes[2, 1]
 
     ax_mean.axhline(float(initial_mean_loss), label="initial mean", color="black", linestyle="--")
-    ax_mean.plot(means, label="mean")
+    ax_mean.plot(x_iters, means, label="training mean", color="tab:red")
+    if has_random_baseline:
+        ax_mean.plot(x_iters, random_means, label="random mean", color="tab:blue")
+        ax_mean.fill_between(
+            x_iters,
+            np.asarray(random_means) - np.asarray(random_stds),
+            np.asarray(random_means) + np.asarray(random_stds),
+            color="tab:blue",
+            alpha=0.2,
+            label="random mean ± std",
+        )
     ax_mean.legend()
     ax_mean.set_title("Mean Distance")
     ax_mean.set_xlabel("Iteration")
     ax_mean.set_ylabel("Distance [m]")
     ax_mean.grid(True, alpha=0.3)
 
-    ax_std.plot(stds, label="std")
+    ax_std.plot(x_iters, stds, label="training std", color="tab:red")
+    if has_random_baseline:
+        ax_std.plot(x_iters, random_stds, label="random std", color="tab:blue")
     ax_std.legend()
     ax_std.set_title("Standard Deviation")
     ax_std.set_xlabel("Iteration")
@@ -324,6 +345,8 @@ def plot_results(
     if save_filepath is None:
         save_filepath = save_dir / "surco_prior.png"
     plt.savefig(save_filepath, bbox_inches="tight")
+    if save_filepath2 is not None:
+        plt.savefig(save_filepath2, bbox_inches="tight")
     print(f"Saved plot to {save_filepath}")
     plt.close()
     if open_after_save:
@@ -331,7 +354,18 @@ def plot_results(
         os.system(f"xdg-open {save_filepath}")
 
 
-def save_json(iteration_json_path, iteration, loss, mean_dist, final_dists_np, c_batch, x_batch, grad_c):
+def save_json(
+    iteration_json_path,
+    iteration,
+    loss,
+    mean_dist,
+    final_dists_np,
+    c_batch,
+    x_batch,
+    grad_c,
+    random_action_mean_final_distance=None,
+    random_action_std_final_distance=None,
+):
     iteration_payload = {
         "iteration": iteration,
         "loss": float(loss),
@@ -340,8 +374,50 @@ def save_json(iteration_json_path, iteration, loss, mean_dist, final_dists_np, c
         "c": np.asarray(c_batch).tolist(),
         "x": x_batch.tolist(),
         "dloss_dc": grad_c.tolist(),
+        "random_action_mean_final_distance": (
+            None if random_action_mean_final_distance is None else float(random_action_mean_final_distance)
+        ),
+        "random_action_std_final_distance": (
+            None if random_action_std_final_distance is None else float(random_action_std_final_distance)
+        ),
+        "random_action_sample_k": None if random_action_mean_final_distance is None else RANDOM_ACTION_SAMPLE_K,
     }
     iteration_json_path.write_text(json.dumps(iteration_payload, indent=2))
+
+
+def random_action_mean_variance(
+    eval_env: PushTEnv,
+    target_pose: np.ndarray,
+    t_pose: np.ndarray,
+    seed: int,
+    random_sample_k: int,
+    n_action_steps: int = 1,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(seed=seed)
+    results: list[float] = []
+    target_poses = np.asarray(target_pose, dtype=np.float32).reshape(1, 3)
+    t_poses = np.asarray(t_pose, dtype=np.float32).reshape(1, 3)
+    for _ in tqdm(range(random_sample_k), desc="Random actions", unit="action", leave=False):
+        eval_env.reset(seed=seed, target_poses=target_poses, t_poses=t_poses)
+        final_distance = None
+        for _action_idx in range(n_action_steps):
+            action = Action(
+                face=np.array([[rng.integers(NUM_FACES)]], dtype=np.int32),
+                contact_point=np.array(
+                    [[rng.uniform(CONTACT_POINT_BOUNDS[0], CONTACT_POINT_BOUNDS[1])]],
+                    dtype=np.float32,
+                ),
+                angle=np.array(
+                    [[rng.uniform(float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1]))]],
+                    dtype=np.float32,
+                ),
+            )
+            result = eval_env.step(action=action, n_sim_steps=N_SIM_STEPS, check_t_displacement=False)
+            t_distances = np.asarray(result.t_distances)[0]
+            final_distance = float(t_distances[-1])
+        assert final_distance is not None, "n_action_steps must be positive"
+        results.append(final_distance)
+    return float(np.mean(results)), float(np.std(results))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -354,15 +430,16 @@ def main(
     random_t_pose: bool,
     record_video: bool,
     multi_step_n_actions: int | None,
+    disable_random: bool,
 ):
     assert problem_type in ["single_step", "multi_step"], "problem_type must be 'single_step' or 'multi_step'."
     assert verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     is_multi_step = multi_step_n_actions is not None
     n_action_blocks = multi_step_n_actions if is_multi_step else 1
-    effective_problem_type = "multi_step" if is_multi_step else problem_type
     _configure_solver(multi_step_n_actions)
 
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False)
+    random_eval_env = None if disable_random else PushTEnv(nenvs=1, record_video=False, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
     solver_output_dim = ACTION_DIM * n_action_blocks
@@ -480,6 +557,8 @@ def main(
 
     means = []
     stds = []
+    random_means = []
+    random_stds = []
     dist_delta_hist = []  # list of (n_envs,) float — change in final distance from iter 1 per env
     face_hist = []  # list of (n_envs,) int — argmax face per env per iter
     cp_hist = []  # list of (n_envs,) float — contact_point per env per iter
@@ -579,7 +658,34 @@ def main(
         if verbosity > 1:
             cprint(f"|____ c=           {np.asarray(c_batch).tolist()}", "yellow")
             cprint(f"|____ dloss/dc=    {grad_c.tolist()}", "yellow")
-        save_json(iterations_dir / f"{it:03d}.json", it, loss, mean_dist, final_dists_np, c_batch, x_batch, grad_c)
+        random_mean = None
+        random_std = None
+        if not disable_random:
+            assert random_eval_env is not None
+            random_mean, random_std = random_action_mean_variance(
+                random_eval_env,
+                target_pose=env.target_poses[0],
+                t_pose=env.t_poses[0],
+                seed=it,
+                random_sample_k=RANDOM_ACTION_SAMPLE_K,
+                n_action_steps=n_action_blocks,
+            )
+            cprint(
+                f"|____ random baseline (env 0): mean={random_mean:.5f} [m], std={random_std:.5f} [m], k={RANDOM_ACTION_SAMPLE_K}",
+                "cyan",
+            )
+        save_json(
+            iterations_dir / f"{it:03d}.json",
+            it,
+            loss,
+            mean_dist,
+            final_dists_np,
+            c_batch,
+            x_batch,
+            grad_c,
+            random_mean,
+            random_std,
+        )
 
         # Print gradient statistics
         #
@@ -593,6 +699,9 @@ def main(
         #
         means.append(float(np.nanmean(final_dists_np)))
         stds.append(float(np.nanstd(final_dists_np)))
+        if random_mean is not None and random_std is not None:
+            random_means.append(random_mean)
+            random_stds.append(random_std)
         dist_delta_hist.append(final_dists_np - initial_final_dists)
         face_hist.append(face_hist_current)
         cp_hist.append(cp_hist_current)
@@ -605,18 +714,21 @@ def main(
             mlp.save_mlp_weights(filepath, params)
             cprint(f"|____ saved weights to {filepath}", "yellow")
             plot_results(
-                save_dir,
-                means,
-                stds,
-                dist_delta_hist,
-                face_hist,
-                cp_hist,
-                ang_hist,
-                n_envs,
-                N_SIM_STEPS,
-                N_OPT_STEPS,
-                random_t_pose,
+                save_dir=save_dir,
+                means=means,
+                stds=stds,
+                dist_delta_hist=dist_delta_hist,
+                face_hist=face_hist,
+                cp_hist=cp_hist,
+                ang_hist=ang_hist,
+                n_envs=n_envs,
+                n_sim_steps=N_SIM_STEPS,
+                n_opt_steps=N_OPT_STEPS,
+                random_t_pose=random_t_pose,
+                random_means=random_means if random_means else None,
+                random_stds=random_stds if random_stds else None,
                 save_filepath=save_dir / f"{it + 1:03d}.png",
+                save_filepath2=save_dir / f"latest.png",
                 open_after_save=False,
             )
         if mean_dist < lowest_mean_dist:
@@ -624,7 +736,9 @@ def main(
             cprint(f"New lowest mean dist: {lowest_mean_dist:.5f} [m]", "green")
             filepath = checkpoints_dir / f"mlp_lowest_mean_dist.npz"
             mlp.save_mlp_weights(filepath, params)
-            save_json(iterations_dir / f"optimal.json", it, loss, mean_dist, final_dists_np, c_batch, x_batch, grad_c)
+            if record_video:
+                save_filepath = save_dir / f"best.mp4"
+                env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
 
 
         # Save video
@@ -641,17 +755,19 @@ def main(
 
     # ── Plots ──────────────────────────────────────────────────────────────────
     plot_results(
-        save_dir,
-        means,
-        stds,
-        dist_delta_hist,
-        face_hist,
-        cp_hist,
-        ang_hist,
-        n_envs,
-        N_SIM_STEPS,
-        N_OPT_STEPS,
-        random_t_pose,
+        save_dir=save_dir,
+        means=means,
+        stds=stds,
+        dist_delta_hist=dist_delta_hist,
+        face_hist=face_hist,
+        cp_hist=cp_hist,
+        ang_hist=ang_hist,
+        n_envs=n_envs,
+        n_sim_steps=N_SIM_STEPS,
+        n_opt_steps=N_OPT_STEPS,
+        random_t_pose=random_t_pose,
+        random_means=random_means if random_means else None,
+        random_stds=random_stds if random_stds else None,
         open_after_save=True,
     )
 
@@ -664,6 +780,7 @@ if __name__ == "__main__":
     parser.add_argument("--random-t-pose", action="store_true", help="Randomize problem instances each iteration")
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--multi-step-n-actions", type=int)
+    parser.add_argument("--disable-random", action="store_true", help="Skip random action baseline sampling")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     assert args.n_envs is not None, "n_envs must be specified"
@@ -674,4 +791,5 @@ if __name__ == "__main__":
         random_t_pose=args.random_t_pose,
         record_video=args.record_video,
         multi_step_n_actions=args.multi_step_n_actions,
+        disable_random=args.disable_random,
     )
