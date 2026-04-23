@@ -23,10 +23,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from pusht619.core import ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, Action, PushTEnv
+from pusht619.core import Action, PushTEnv
 from scripts.training_loop import (
     CKPT_PATH,
-    NUM_FACES,
+    N_FACES,
     N_SIM_STEPS,
     SurCoPrior,
     _solve_pure_callback,
@@ -34,6 +34,7 @@ from scripts.training_loop import (
     load_prior_params,
 )
 
+jax.config.update("jax_enable_x64", True)
 
 N_ENVS = 4
 N_PUSHES = 6
@@ -50,7 +51,7 @@ def _set_overhead_camera(env: PushTEnv, distance: float = 3.0):
     the workspace center, orientation = identity (mujoco cameras look along
     their local -Z, so identity quat = looking straight down with +Y up).
     """
-    lookat = np.array([0.75, 0.75, 0.1], dtype=np.float32)
+    lookat = np.array([0.75, 0.75, 0.1], dtype=np.float64)
     cam_pos = lookat + np.array([0.0, 0.0, distance])
     cam_quat = np.array([1.0, 0.0, 0.0, 0.0])  # identity
     for helper in env._mj_model_helpers:
@@ -75,19 +76,17 @@ def run_chain(
     env.reset(seed=seed)
     target_xy = jnp.asarray(env.target_poses[:, :2])
 
-    dist_history = np.zeros((n_envs, n_pushes + 1), dtype=np.float32)
+    dist_history = np.zeros((n_envs, n_pushes + 1), dtype=np.float64)
     t_xy0 = np.asarray(env._poses[:, :2])
     dist_history[:, 0] = np.linalg.norm(t_xy0 - np.asarray(target_xy), axis=-1)
 
     for k in range(n_pushes):
         y = extract_y(env.data, target_xy)
         c = SurCoPrior().apply(params, y)
-        face_onehot = np.asarray(_solve_pure_callback(c[:, :NUM_FACES]))
+        face_onehot = np.asarray(_solve_pure_callback(c[:, :N_FACES]))
         face = np.argmax(face_onehot, axis=-1).astype(np.int32).reshape(-1, 1)
-        lo_cp, hi_cp = CONTACT_POINT_BOUNDS
-        lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
-        contact = np.asarray(lo_cp + (hi_cp - lo_cp) * jax.nn.sigmoid(c[:, 6])).reshape(-1, 1)
-        angle = np.asarray(lo_ang + (hi_ang - lo_ang) * jax.nn.sigmoid(c[:, 7])).reshape(-1, 1)
+        contact = np.asarray(jax.nn.sigmoid(c[:, 6])).reshape(-1, 1)
+        angle = np.asarray(jnp.pi * jax.nn.sigmoid(c[:, 7])).reshape(-1, 1)
 
         result = env.step(
             Action(face=face, contact_point=contact, angle=angle),
@@ -124,7 +123,9 @@ def test_chain_deploy_monotone_on_average():
 
 if __name__ == "__main__":
     if not CKPT_PATH.exists():
-        raise SystemExit(f"No checkpoint at {CKPT_PATH}. Run `python scripts/training_loop.py` first.")
+        raise SystemExit(
+            f"No checkpoint at {CKPT_PATH}. Run `python scripts/training_loop.py` first."
+        )
     print("=" * 70)
     print(f"Chained deployment  ({N_ENVS} envs × {N_PUSHES} pushes, seed={SEED})")
     print("=" * 70)
