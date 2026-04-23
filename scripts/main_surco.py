@@ -59,17 +59,17 @@ System design (SurCo-prior):
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
 
 # Random t-pose
-python scripts/main_surco_jm.py --n-envs 100 --random-t-pose
-python scripts/main_surco_jm.py --n-envs 64 --random-t-pose
-python scripts/main_surco_jm.py --n-envs 16 --random-t-pose
-python scripts/main_surco_jm.py --n-envs 25  --random-t-pose --verbosity 1 --record-video
-python scripts/main_surco_jm.py --n-envs 25 --random-t-pose --verbosity 1 --record-video --multi-step-n-actions 2
+python scripts/main_surco.py --n-envs 100 --random-t-pose
+python scripts/main_surco.py --n-envs 64 --random-t-pose
+python scripts/main_surco.py --n-envs 16 --random-t-pose
+python scripts/main_surco.py --n-envs 25  --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 25 --random-t-pose --verbosity 1 --record-video --multi-step-n-actions 2
 
 
 # Fixed t-pose
-python scripts/main_surco_jm.py --n-envs 25 --verbosity 1 --record-video
-python scripts/main_surco_jm.py --n-envs 1 --verbosity 2 --record-video
-python scripts/main_surco_jm.py --n-envs 1 --verbosity 1 --record-video --multi-step-n-actions 2 --disable-random
+python scripts/main_surco.py --n-envs 25 --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --verbosity 2 --record-video
+python scripts/main_surco.py --n-envs 1 --verbosity 1 --record-video --multi-step-n-actions 2 --disable-random
 """
 
 from __future__ import annotations

@@ -308,7 +308,7 @@ if __name__ == "__main__":
         "--iterations-dir",
         type=Path,
         required=True,
-        help="Directory containing per-iteration JSON files saved by main_surco_jm.py",
+        help="Directory containing per-iteration JSON files saved by main_surco.py",
     )
     args = parser.parse_args()
     main(

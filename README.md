@@ -1,4 +1,28 @@
-# CSCI 619 - Class Project
+# PushT with Differentiable Simulation and Mixed Integer Quadratic Programming
+
+This project solves the planar PushT manipulation problem using a hybrid optimization pipeline. A neural network predicts the parameters for a mixed integer quadratic program which is solved by Gurobi. The solution to the MIQP is interpreted as the push action (face, contact-point, angle). Jaxsim then rolls these actions out to get a loss value, namely the difference in pose between the target T and the T. The gradient is then backpropped through to the action via jaxsim's native differentiability. To complete the gradient graph, randomized smoothing is used to estimate the gradient of the MIQP parameters produced by the NN. This method is an implementation of [SurCo](https://arxiv.org/pdf/2210.12547). There are two problem varieties: single-step and multi-step pushing. You can also get the (nearly) optimal action for single-step and multi-step single and fixed T poses to compare against the learned policy.
+
+
+**Probelm Summary**
+![Problem figure](media/problem_figure.png)
+
+**System Diagram**
+![System diagram](media/system_diagram.png)
+
+**Single-push learned policy**
+![Single-push rollout](media/single-push.gif)
+
+**Multi-push learned policy**
+![Multi-push rollout](media/multi-push.gif)
+
+
+
+This is my final project for CSCI 619 (Spring 2026).
+
+
+
+
+
 
 **T block:**
 ```
@@ -101,7 +125,6 @@ _________________
 
 Note that urdfs can be easily visualized using the [URDF Visualizer](https://marketplace.cursorapi.com/items/?itemName=morningfrog.urdf-visualizer) VSCode extension.
 
-
 ## Installation
 
 Create and activate the conda environment, then install the package in editable mode.
@@ -116,11 +139,16 @@ pip install jax[cuda12] # if you have a nvidia card
 ```
 
 
-## Running the project
+## Usage
 
 * NOTE: If using claude code, make sure to enter into the conda environment first.
 
-```bash
-unset LD_LIBRARY_PATH
-python scripts/main.py
+```
+# Random t-pose
+python scripts/main_surco.py --n-envs 25 --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --random-t-pose --verbosity 1 --record-video --multi-step-n-actions 2
+
+# Fixed t-pose
+python scripts/main_surco.py --n-envs 1 --verbosity 2 --record-video
+python scripts/main_surco.py --n-envs 1 --verbosity 1 --record-video --multi-step-n-actions 2 --disable-random
 ```
