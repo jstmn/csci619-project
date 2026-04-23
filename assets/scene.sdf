@@ -228,8 +228,8 @@
           <box><size>0.20 0.05 0.05</size></box>
         </geometry>
         <material>
-          <ambient>0.90 0.50 0.10 1.0</ambient>
-          <diffuse>0.90 0.50 0.10 1.0</diffuse>
+          <ambient>0.9 0.1 0.1 1.0</ambient>
+          <diffuse>0.9 0.1 0.1 1.0</diffuse>
         </material>
       </visual>
 
@@ -246,8 +246,8 @@
           <box><size>0.05 0.20 0.05</size></box>
         </geometry>
         <material>
-          <ambient>0.90 0.50 0.10 1.0</ambient>
-          <diffuse>0.90 0.50 0.10 1.0</diffuse>
+          <ambient>0.9 0.1 0.1 1.0</ambient>
+          <diffuse>0.9 0.1 0.1 1.0</diffuse>
         </material>
       </visual>
     </link>
@@ -305,12 +305,6 @@
       </inertial>
 
       <!-- Top bar -->
-      <!-- <collision name="top_bar">
-        <pose>0 0.10 0.0025 0 0 0</pose>
-        <geometry>
-          <box><size>0.20 0.05 0.005</size></box>
-        </geometry>
-      </collision> -->
       <visual name="t_target_top_bar_visual">
         <pose>0 0.10 0.0025 0 0 0</pose>
         <geometry>
@@ -323,12 +317,6 @@
       </visual>
 
       <!-- Stem -->
-      <!-- <collision name="stem">
-        <pose>0 -0.025 0.0025 0 0 0</pose>
-        <geometry>
-          <box><size>0.05 0.20 0.005</size></box>
-        </geometry>
-      </collision> -->
       <visual name="t_target_stem_visual">
         <pose>0 -0.025 0.0025 0 0 0</pose>
         <geometry>
@@ -390,8 +378,8 @@
           </cylinder>
         </geometry>
         <material>
-          <ambient>0.20 0.40 0.80 1.0</ambient>
-          <diffuse>0.20 0.40 0.80 1.0</diffuse>
+          <ambient>0.90 0.90 0.80 1.0</ambient>
+          <diffuse>0.90 0.90 1.00 1.0</diffuse>
         </material>
       </visual>
     </link>

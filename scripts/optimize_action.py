@@ -14,123 +14,282 @@ TODOS:
 3. Randomize the target poses and see if the agent can learn to push from any configuration.
 
 
-Run it:
-    python scripts/optimize_action.py
+# Run it:
+
+unset LD_LIBRARY_PATH
+python scripts/optimize_action.py --random-side --random-t-pose --record-video --verbosity 1
+python scripts/optimize_action.py --verbosity 1 --record-video
 """
 
 from __future__ import annotations
 
-import time
-from pathlib import Path
+from time import time
 
+PROGRAM_START_TIME = time()
+from datetime import datetime
+from pathlib import Path
+from typing import Sequence
+
+import matplotlib.pyplot as plt
+from termcolor import cprint
 import jax
+
+jax.config.update("jax_compilation_cache_dir", str(Path.home() / ".cache/jax_pusht619"))
 import jax.numpy as jnp
 import numpy as np
+import argparse
 
-from pusht619.core import Action, PushTEnv 
+from pusht619.core import PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS
 
-jax.config.update("jax_enable_x64", True) #
 
-N_ENVS = 100
+class MLP:
+    """Maps a context vector to two unconstrained action parameters (u_contact, u_angle).
+
+    Apply sigmoid / pi*sigmoid downstream to recover valid contact_point and angle.
+
+    Params are a list of (W, b) tuples — a plain JAX pytree, jit/grad compatible.
+    """
+
+    def __init__(
+        self, context_dim: int, output_ranges: list[tuple[float, float]], hidden_dims: Sequence[int] = (64, 64)
+    ):
+        self.output_ranges = output_ranges
+        self.layer_sizes = [context_dim, *hidden_dims, 2]
+
+    def init(self, key: jax.Array) -> list[tuple[jnp.ndarray, jnp.ndarray]]:
+        params = []
+        for i in range(len(self.layer_sizes) - 1):
+            key, subkey = jax.random.split(key)
+            fan_in, fan_out = self.layer_sizes[i], self.layer_sizes[i + 1]
+            w = jax.random.normal(subkey, (fan_in, fan_out), dtype=jnp.float32) * jnp.sqrt(2.0 / fan_in)
+            b = jnp.zeros(fan_out, dtype=jnp.float32)
+            params.append((w, b))
+        return params
+
+    def apply(self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray) -> jnp.ndarray:
+        """Forward pass. Returns shape (..., 2) — columns are [u_contact, u_angle]."""
+        for i, (w, b) in enumerate(params):
+            x = x @ w + b
+            if i < len(params) - 1:
+                x = jax.nn.relu(x)
+        for i, (lo, hi) in enumerate(self.output_ranges):
+            x = x.at[:, i].set(lo + (hi - lo) * jax.nn.sigmoid(x[:, i]))
+        return x
+
+
+N_OPT_STEPS = 50
+LR = 2.0
+N_ENVS = 64
+# N_ENVS = 9
 N_SIM_STEPS = 50
-N_OPT_STEPS = 100
-LR_ACTION = 0.25  # for u_contact / u_angle (smooth)
-LR_FACE = 1.0  # for face_logits — keep modest so distance gradient can steer face choice
-LAMBDA_ENT = 0.005  # entropy reg — repels flat weights but weak enough to allow face switching
-RESET_SEED = 0  # Same layout every reset; change or use ``seed + it`` for variety.
+RESET_SEED = 0
 
 
-def main():
-    env = PushTEnv(nenvs=N_ENVS, record_video=True, visualize=False)
+def main(random_side: bool, random_t_pose: bool, record_video: bool, verbosity: int):
+    env = PushTEnv(nenvs=N_ENVS, record_video=record_video, visualize=False)
     env.reset(seed=RESET_SEED)
+    now = datetime.now().strftime("%d__%H:%M:%S")
+    save_dir = Path(f"videos/{now}")
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.default_rng(seed=1)
-    init_face = rng.integers(0, 6, size=(N_ENVS,), dtype=np.int32)
-    # Warm-start face_logits with a +FACE_BIAS on a random face per env. The
-    # bias is a tradeoff: too low (~0) → near-uniform weights put the contact
-    # body *inside* the T block and blow up spring-damper contacts; too high
-    # (~5) → softmax saturates and the face gradient vanishes (Jacobian scales
-    # like p(1-p)). 1.5 is peaked (p≈0.44) but leaves meaningful gradient flow.
-    FACE_BIAS = 3.0
-    face_logits = jnp.zeros((N_ENVS, 6), dtype=jnp.float64).at[jnp.arange(N_ENVS), jnp.asarray(init_face)].set(FACE_BIAS)
+    # Context vector (dim=11): T_target_pose(3) | T_pose(3) | T_velocity(3) | pusher_xy(2)
+    mlp = MLP(context_dim=11, output_ranges=[CONTACT_POINT_BOUNDS, ANGLE_BOUNDS])
+    params = mlp.init(jax.random.PRNGKey(0))
+    rng = np.random.default_rng(seed=RESET_SEED)
 
-    # Unconstrained optimizer variables; sigmoid maps them into valid ranges.
-    u_contact = jnp.zeros((N_ENVS,), dtype=jnp.float64)  # → contact = 0.5
-    u_angle = jnp.zeros((N_ENVS,), dtype=jnp.float64)  # → angle = π/2
+    def cost(params, data, faces):
+        ctx = env.get_context_vector(data)
+        out = mlp.apply(params, ctx)  # (N_ENVS, 2)
+        contact_point, angle = out[:, 0], out[:, 1]
 
-    def cost(face_logits, u_contact, u_angle, data0, target_xy):
-        face_weights = jax.nn.softmax(face_logits, axis=-1)
-        contact_point = jax.nn.sigmoid(u_contact)
-        angle = jnp.pi * jax.nn.sigmoid(u_angle)
-        _, _, t_distances, _ = env.step_pure_soft(
-            data=data0,
-            face_weights=face_weights,
+        if verbosity > 1:
+            jax.debug.print(
+                "context  any_nan={n} min={lo:.3f} max={hi:.3f}", n=jnp.any(jnp.isnan(ctx)), lo=ctx.min(), hi=ctx.max()
+            )
+            jax.debug.print("mlp_out  any_nan={n}", n=jnp.any(jnp.isnan(out)))
+            jax.debug.print("contact_point, raw:  {pre}", pre=out[:, 0])
+            jax.debug.print("contact_point, post: {post}", post=contact_point)
+            jax.debug.print("angle        , raw:  {pre}", pre=out[:, 1])
+            jax.debug.print("angle        , post: {post}", post=angle)
+
+        _, _, t_distances, jpos_traj = env.step_pure(
+            data=data,
+            face=faces[:, 0].astype(jnp.int32),
             contact_point=contact_point,
             angle=angle,
-            target_xy=target_xy,
             n_sim_steps=N_SIM_STEPS,
         )
-        # Entropy = -Σ w log w  (max at uniform, 0 at one-hot). Add λ·H to cost
-        # so the optimizer is repelled from flat weights — flat puts the
-        # contact body inside the T and explodes the spring-damper.
-        dist_sum = t_distances[:, -1].sum()
-        entropy = -(face_weights * jnp.log(face_weights + 1e-12)).sum(axis=-1).sum()
-        total = dist_sum + LAMBDA_ENT * entropy
-        return total, (dist_sum, entropy)
-
-    cost_and_grad = jax.jit(jax.value_and_grad(cost, argnums=(0, 1, 2), has_aux=True))
-
-    print("Optimizing `face_logits`, `contact_point`, `angle` by gradient descent")
-    t_start = time.time()
-    for it in range(N_OPT_STEPS):
-        env.reset(seed=RESET_SEED)
-        data0 = env.data
-        target_xy = jnp.asarray(env.target_poses[:, :2])
-
-        t0 = time.time()
-        (_, (dist_sum, entropy)), (g_face, g_contact, g_angle) = cost_and_grad(
-            face_logits, u_contact, u_angle, data0, target_xy
+        assert t_distances.shape == (N_ENVS, N_SIM_STEPS), (
+            f"t_distances must be ({N_ENVS}, {N_SIM_STEPS}), got {t_distances.shape}"
         )
-        face_logits = face_logits - LR_FACE * g_face
-        u_contact = u_contact - LR_ACTION * g_contact
-        u_angle = u_angle - LR_ACTION * g_angle
-        dt = time.time() - t0
-        if it == 0 or (it + 1) % 5 == 0:
-            mean_dist = float(dist_sum) / N_ENVS
-            mean_ent = float(entropy) / N_ENVS
-            print(
-                f"  iter {it + 1:4d}: mean dist = {mean_dist:.4f} m  "
-                f"mean entropy = {mean_ent:.3f}  ({dt * 1000:.1f} ms)"
+        # Mean final distance; NaNs from diverged rollouts are ignored (cannot use
+        # jnp.where(cond)[0] here — dynamic nonzero is illegal inside jit).
+        final_dists = t_distances[:, -1]
+        loss = jnp.nanmean(final_dists)
+        if verbosity > 0:
+            jax.debug.print(
+                "t_dist   sum(is_nan)={n} final_dists={d}", n=jnp.sum(jnp.isnan(final_dists)), d=final_dists
             )
-    print(f"Optimization took {time.time() - t_start:.2f} s total")
+        return loss, (t_distances, jpos_traj, contact_point, angle)
 
-    # Snap to hard argmax face for the visualization rollout.
-    face_final = np.asarray(jnp.argmax(face_logits, axis=-1)).astype(np.int32).reshape(N_ENVS, 1)
-    face_weights_final = jax.nn.softmax(face_logits, axis=-1)
-    face_confidence = np.asarray(jnp.max(face_weights_final, axis=-1))
-    contact_point = jax.nn.sigmoid(u_contact)
-    angle = jnp.pi * jax.nn.sigmoid(u_angle)
-    final_action = Action(
-        face=face_final,
-        contact_point=np.asarray(contact_point).reshape(N_ENVS, 1),
-        angle=np.asarray(angle).reshape(N_ENVS, 1),
-    )
+    cost_and_grad = jax.jit(jax.value_and_grad(cost, argnums=0, has_aux=True))
 
-    env.reset(seed=RESET_SEED)
-    result = env.step(final_action, n_sim_steps=N_SIM_STEPS)
-    t_distances = result.t_distances
+    print("Optimizing MLP params by gradient descent")
+    means = []
+    stds = []
+    maxs = []
+    mins = []
+    angles = []
+    contact_points = []
+    initial_mean_dist = None
+    t_start = time()
+    faces = rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32)
 
-    print("\nLearned per-env action and resulting final distance:")
-    for i in range(N_ENVS):
+    for it in range(N_OPT_STEPS):
+        if it == 0:
+            print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
+
+        if random_side:
+            faces = rng.integers(0, 6, size=(N_ENVS, 1), dtype=np.int32)
+
+        if random_t_pose:
+            env.reset()
+        else:
+            env.reset(seed=RESET_SEED)
+
+        t0 = time()
+        t_poses_0 = env.t_poses
+        env_data_0 = env.data
+        (loss, (t_distances, jpos_traj, contact_point, angle)), g_raw = cost_and_grad(params, env_data_0, faces)
+        n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for layer in g_raw for x in layer)
+        g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
+        params = jax.tree.map(lambda p, g: p - LR * g, params, g_params)
+        dt = time() - t0
+        if initial_mean_dist is None:
+            initial_mean_dist = loss
+        print()
         print(
-            f"  env {i}: face={int(final_action.face[i, 0])} (p={float(face_confidence[i]):.2f})  "
-            f"contact_point={float(final_action.contact_point[i, 0]):.3f}  "
-            f"angle={float(final_action.angle[i, 0]):.3f}  "
-            f"final_distance={float(t_distances[i, -1]):.4f} m"
+            f"===  iter {it + 1:2d}  ===  |  mean dist: {loss:.6f} [m] | delta from initial: {100 * (loss - initial_mean_dist):.4f} [cm] | {dt * 1000:.1f} ms"
         )
 
-    env.save_video(Path("/tmp/learned_action.mp4"))
+        if n_bad_grads > 0:
+            cprint(
+                f"  WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).", "red"
+            )
+
+        # Check gradient statistics
+        if verbosity > 0:
+            grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
+            max_grad = max(jnp.max(g).item() for g in grad_abs_values)
+            mean_abs_change = jnp.mean(jnp.array([jnp.mean(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
+            std_change = jnp.std(jnp.array([jnp.std(LR * jnp.abs(g)).item() for g in grad_abs_values])).item()
+            print(f"  max |grad|: {max_grad:.6f}, mean |change|: {mean_abs_change:.6f}, std |change|: {std_change:.6f}")
+
+        # Save stats
+        means.append(t_distances[:, -1].mean())
+        stds.append(t_distances[:, -1].std())
+        maxs.append(t_distances[:, -1].max())
+        mins.append(t_distances[:, -1].min())
+        angles.append(np.asarray(angle))
+        contact_points.append(np.asarray(contact_point))
+
+        # Save videos
+        if record_video:
+            save_filepath = save_dir / f"{it:03d}.mp4"
+            env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
+            if verbosity > 1:
+                print(f"  saved {save_filepath}")
+
+        # On NaN: save debug JSON + per-failing-env video
+        final_dists = np.asarray(t_distances[:, -1])
+        nan_envs = np.where(np.isnan(final_dists))[0].tolist()
+        if nan_envs:
+            for env_idx in nan_envs:
+                print(f"  Env: {env_idx} - T distance is NaN")
+                print("    T_pose before:       ", t_poses_0[env_idx])
+                print("    T_pose after:        ", env.t_poses[env_idx])
+                print("    contact_poin:        ", contact_point[env_idx])
+                print("    angle:               ", angle[env_idx])
+                print("    pusher position_0:   ", env_data_0.base_position[env_idx])
+                print("    pusher orientation_0:", env_data_0.base_orientation[env_idx])
+                print("    joint positions_0:   ", env_data_0.joint_positions[env_idx])
+                print("    joint velocities_0:  ", env_data_0.joint_velocities[env_idx])
+
+        if it == 0:
+            print(f"First iteration time: {time() - t_start:.2f} s")
+
+    print(f"Optimization took {time() - t_start:.2f} s total")
+
+    # ================================================
+    # Plot results
+    #
+    # Determine layout based on randomization settings
+    show_action_plots = not random_side and not random_t_pose
+    if show_action_plots:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        ax1, ax3 = axes[0, 0], axes[0, 1]
+        ax2, ax4 = axes[1, 0], axes[1, 1]
+    else:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    fig.suptitle(
+        f"Optimization Results - N_ENVS={N_ENVS}, N_SIM_STEPS={N_SIM_STEPS}, N_OPT_STEPS={N_OPT_STEPS}, RANDOM_SIDE={random_side}, RANDOM_T_POSE={random_t_pose}"
+    )
+    # Left plot: mean with min and max
+    ax1.axhline(initial_mean_dist, label="initial mean", color="black")
+    ax1.plot(means, label="mean")
+    ax1.legend()
+    ax1.set_title("Mean Distance")
+    ax1.set_xlabel("Iteration")
+    ax1.set_ylabel("Distance [m]")
+    ax1.grid(True, alpha=0.3)
+
+    # Right plot: std
+    ax2.plot(stds, label="std")
+    ax2.legend()
+    ax2.set_title("Standard Deviation")
+    ax2.set_xlabel("Iteration")
+    ax2.set_ylabel("Distance Standard Deviation [m]")
+    ax2.grid(True, alpha=0.3)
+
+    # If not randomizing, show angle and contact_point for first environment
+    if show_action_plots:
+        # Extract first environment's angle and contact_point over iterations
+        # angles and contact_points are lists of arrays with shape (nenvs, 1)
+        for env_idx in range(5):
+            env_angles = [a[env_idx] for a in angles]
+            env_contact_points = [cp[env_idx] for cp in contact_points]
+            ax3.plot(env_angles, label=f"Angle [env {env_idx}]")
+            ax4.plot(env_contact_points, label=f"Contact Point [env {env_idx}]")
+        ax3.legend()
+        ax3.set_title("Angle")
+        ax3.set_xlabel("Iteration")
+        ax3.set_ylabel("Angle [rad]")
+        ax3.grid(True, alpha=0.3)
+        ax4.legend()
+        ax4.set_title("Contact Point")
+        ax4.set_xlabel("Iteration")
+        ax4.set_ylabel("Contact Point")
+        ax4.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    save_filepath = save_dir / "optimization.png"
+    plt.savefig(save_filepath, bbox_inches="tight")
+    print(f"Saved plot to {save_filepath}")
+    print(f"xdg-open {save_filepath}")
+    plt.close()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--random-side", action="store_true", help="Randomize the side of the target object")
+    parser.add_argument("--random-t-pose", action="store_true", help="Randomize the target pose")
+    parser.add_argument("--record-video", action="store_true", help="Record a video of the optimization process")
+    parser.add_argument("--verbosity", type=int, default=0, help="Verbosity level")
+    args = parser.parse_args()
+    main(
+        random_side=args.random_side,
+        random_t_pose=args.random_t_pose,
+        record_video=args.record_video,
+        verbosity=args.verbosity,
+    )

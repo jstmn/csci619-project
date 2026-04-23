@@ -20,6 +20,9 @@ dependencies = [
     "lxml",
     "mediapy",
     "imageio[ffmpeg]",
+    "termcolor",
+    "gurobipy",
+    "tqdm"
 ]
 
 [project.optional-dependencies]

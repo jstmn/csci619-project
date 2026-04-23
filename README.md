@@ -110,6 +110,9 @@ Create and activate the conda environment, then install the package in editable 
 conda create -n pusht619 python=3.10
 conda activate pusht619
 pip install -e ".[dev]"
+
+# AND:
+pip install jax[cuda12] # if you have a nvidia card
 ```
 
 
@@ -118,5 +121,6 @@ pip install -e ".[dev]"
 * NOTE: If using claude code, make sure to enter into the conda environment first.
 
 ```bash
+unset LD_LIBRARY_PATH
 python scripts/main.py
 ```
