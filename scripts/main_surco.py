@@ -59,17 +59,24 @@ System design (SurCo-prior):
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
 
 # Random t-pose
-python scripts/main_surco.py --n-envs 100 --random-t-pose
 python scripts/main_surco.py --n-envs 64 --random-t-pose
-python scripts/main_surco.py --n-envs 16 --random-t-pose
-python scripts/main_surco.py --n-envs 25  --random-t-pose --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 25 --random-t-pose --verbosity 1 --record-video --multi-step-n-actions 2
+python scripts/main_surco.py --n-envs 16 --relative-coordinates --random-t-pose --relative-coordinates
+python scripts/main_surco.py --n-envs 25 --relative-coordinates --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 25 --relative-coordinates --random-t-pose --verbosity 1 --record-video --multi-step-n-actions 2
+python scripts/main_surco.py --n-envs 1 --use-soft-face --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --use-hard-face --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-soft-face --random-t-pose --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-hard-face --random-t-pose --verbosity 1 --record-video
 
 
 # Fixed t-pose
 python scripts/main_surco.py --n-envs 25 --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 1 --verbosity 2 --record-video
-python scripts/main_surco.py --n-envs 1 --verbosity 1 --record-video --multi-step-n-actions 2 --disable-random
+
+python scripts/main_surco.py --n-envs 1 --use-soft-face --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --use-hard-face --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-soft-face --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-hard-face --verbosity 1 --record-video
+
 """
 
 from __future__ import annotations
@@ -250,6 +257,8 @@ def plot_results(
     n_sim_steps,
     n_opt_steps,
     random_t_pose,
+    relative_coordinates: bool,
+    use_soft_face: bool,
     random_means=None,
     random_stds=None,
     save_filepath=None,
@@ -263,7 +272,8 @@ def plot_results(
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  n_sim_steps={n_sim_steps}  "
         f"n_opt_steps={n_opt_steps}  K={RANDOMZED_SMOOTHING_K}  λ={PERTURB_LAMBDA}  "
-        f"RANDOM_T_POSE={random_t_pose}"
+        f"RANDOM_T_POSE={random_t_pose}  FACE_MODE={'soft' if use_soft_face else 'hard'}  RELATIVE_COORDINATES={relative_coordinates}",
+        fontweight="bold",
     )
     ax_mean, ax_std = axes[0, 0], axes[0, 1]
     ax_cp, ax_ang = axes[1, 0], axes[1, 1]
@@ -397,8 +407,8 @@ def random_action_mean_variance(
     results: list[float] = []
     target_poses = np.asarray(target_pose, dtype=np.float32).reshape(1, 3)
     t_poses = np.asarray(t_pose, dtype=np.float32).reshape(1, 3)
-    for _ in tqdm(range(random_sample_k), desc="Random actions", unit="action", leave=False):
-        eval_env.reset(seed=seed, target_poses=target_poses, t_poses=t_poses)
+    for k in tqdm(range(random_sample_k), desc="Random actions", unit="action", leave=False):
+        eval_env.reset(seed=seed + k, target_poses=target_poses, t_poses=t_poses)
         final_distance = None
         for _action_idx in range(n_action_steps):
             action = Action(
@@ -429,16 +439,21 @@ def main(
     verbosity: int,
     random_t_pose: bool,
     record_video: bool,
+    use_soft_face: bool,
+    use_hard_face: bool,
     multi_step_n_actions: int | None,
     disable_random: bool,
+    relative_coordinates: bool,
 ):
     assert problem_type in ["single_step", "multi_step"], "problem_type must be 'single_step' or 'multi_step'."
     assert verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
+    assert use_soft_face or use_hard_face, "At least one of use_soft_face or use_hard_face must be True."
+    assert not (use_soft_face and use_hard_face), "use_soft_face and use_hard_face cannot be True at the same time."
     is_multi_step = multi_step_n_actions is not None
     n_action_blocks = multi_step_n_actions if is_multi_step else 1
     _configure_solver(multi_step_n_actions)
 
-    env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False)
+    env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False, use_relative_coordinates=relative_coordinates)
     random_eval_env = None if disable_random else PushTEnv(nenvs=1, record_video=False, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
@@ -493,14 +508,26 @@ def main(
         t_distances_parts = []
         jpos_traj_parts = []
         for action_idx in range(n_action_blocks):
-            rollout_data, _, t_distances_step, jpos_traj_step = env.step_pure_soft(
-                data=rollout_data,
-                face_weights=face_weights[:, action_idx, :],
-                contact_point=contact_points[:, action_idx],
-                angle=angles[:, action_idx],
-                n_sim_steps=N_SIM_STEPS,
-                check_t_displacement=False,
-            )
+            if use_soft_face:
+                rollout_data, _, t_distances_step, jpos_traj_step = env.step_pure_soft(
+                    face_weights=face_weights[:, action_idx, :],
+                    data=rollout_data,
+                    contact_point=contact_points[:, action_idx],
+                    angle=angles[:, action_idx],
+                    n_sim_steps=N_SIM_STEPS,
+                    check_t_displacement=False,
+                )
+            elif use_hard_face:
+                rollout_data, _, t_distances_step, jpos_traj_step = env.step_pure(
+                    face=jnp.argmax(face_weights[:, action_idx, :], axis=-1),
+                    data=rollout_data,
+                    contact_point=contact_points[:, action_idx],
+                    angle=angles[:, action_idx],
+                    n_sim_steps=N_SIM_STEPS,
+                    check_t_displacement=False,
+                )
+            else:
+                raise ValueError(f"Invalid face mode: {args.use_soft_face} or {args.use_hard_face}")
             t_distances_parts.append(t_distances_step)
             jpos_traj_parts.append(jpos_traj_step)
         t_distances = jnp.concatenate(t_distances_parts, axis=1)
@@ -725,6 +752,8 @@ def main(
                 n_sim_steps=N_SIM_STEPS,
                 n_opt_steps=N_OPT_STEPS,
                 random_t_pose=random_t_pose,
+                use_soft_face=use_soft_face,
+                relative_coordinates=relative_coordinates,
                 random_means=random_means if random_means else None,
                 random_stds=random_stds if random_stds else None,
                 save_filepath=save_dir / f"{it + 1:03d}.png",
@@ -781,6 +810,9 @@ if __name__ == "__main__":
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--multi-step-n-actions", type=int)
     parser.add_argument("--disable-random", action="store_true", help="Skip random action baseline sampling")
+    parser.add_argument("--use-soft-face", action="store_true", help="Use soft face mode")
+    parser.add_argument("--use-hard-face", action="store_true", help="Use hard face mode")
+    parser.add_argument("--relative-coordinates", action="store_true", help="Use relative coordinates")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     assert args.n_envs is not None, "n_envs must be specified"
@@ -792,4 +824,7 @@ if __name__ == "__main__":
         record_video=args.record_video,
         multi_step_n_actions=args.multi_step_n_actions,
         disable_random=args.disable_random,
+        use_soft_face=args.use_soft_face,
+        use_hard_face=args.use_hard_face,
+        relative_coordinates=args.relative_coordinates,
     )

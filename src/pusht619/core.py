@@ -153,18 +153,36 @@ def _plan_push_jax(
     assert contact_point.shape == (nenvs,), f"contact_point must be (nenvs,), got {contact_point.shape}"
     assert angle.shape == (nenvs,), f"angle must be (nenvs,), got {angle.shape}"
 
+    # --- Face geometry (body frame) ---
+    # Hard mode (int): index directly into the precomputed table — no gradient through face.
+    # Soft mode (float weights): take a convex combination of all face endpoints.
+    #   face_starts/ends become a weighted average of every face's start/end point,
+    #   so gradients flow back into face_weights through the matmul.
     if face.ndim == 1:
         face_starts = _FACE_START_POINTS_JAX[face]  # (nenvs, 2) — hard gather, no gradient
         face_ends = _FACE_END_POINTS_JAX[face]
     else:
-        face_starts = face @ _FACE_START_POINTS_JAX  # (nenvs,NUM_FACES)@(NUM_FACES,2) → (nenvs,2), differentiable
+        # (nenvs, NUM_FACES) @ (NUM_FACES, 2) → (nenvs, 2): differentiable weighted average
+        face_starts = face @ _FACE_START_POINTS_JAX
         face_ends = face @ _FACE_END_POINTS_JAX
+
+    # Build a local coordinate frame for the (blended) face edge:
+    #   tangent  — unit vector along the face edge
+    #   inward normal — 90° CCW from tangent, pointing into the T block
     face_vectors = face_ends - face_starts
     face_lengths = jnp.linalg.norm(face_vectors, axis=1, keepdims=True)
     face_tangents = face_vectors / face_lengths
     face_inward_normals = jnp.stack([face_tangents[:, 1], -face_tangents[:, 0]], axis=-1)
+
+    # Place the contact point along the face edge using the scalar contact_point parameter.
+    # Push direction is a blend of tangent and inward normal controlled by `angle`:
+    #   angle=π/2 → purely inward (perpendicular to face), angle=0 → along the edge.
     contact_body = face_starts + contact_point[:, None] * face_vectors
     push_direction_body = jnp.cos(angle)[:, None] * face_tangents + jnp.sin(angle)[:, None] * face_inward_normals
+
+    # --- Body → world transform ---
+    # Rotate contact point and push direction from the T block's local frame
+    # into the world frame using the T block's current orientation theta.
     cos_theta = jnp.cos(t_poses[:, 2])
     sin_theta = jnp.sin(t_poses[:, 2])
     rotation_matrices = jnp.stack(
@@ -190,6 +208,9 @@ def _plan_push_jax(
     )
     push_direction_world = push_direction_world / jnp.linalg.norm(push_direction_world, axis=1, keepdims=True)
 
+    # --- Pusher placement ---
+    # pre_contact: pusher surface just touching the T block (offset by pusher radius + clearance).
+    # pusher_start: approach position further back along the push direction.
     pre_contact = contact_world - (PUSHER_RADIUS + PUSHER_CLEARANCE) * push_direction_world
     pusher_start = pre_contact - PUSHER_APPROACH_DISTANCE * push_direction_world
 
@@ -684,10 +705,13 @@ class PushTEnv:
     Parallel Push-T environment.
 
     State: (nenvs, 3) array of [x, y, theta] poses.
+    - use_relative_coordinates: if True, the pose and velocity of the T in the context vector is given in the target T's
+    frame, not the global frame.
     """
 
-    def __init__(self, nenvs: int, record_video: bool = False, visualize: bool = False):
+    def __init__(self, nenvs: int, use_relative_coordinates: bool = False, record_video: bool = False, visualize: bool = False):
         self._nenvs = nenvs
+        self._use_relative_coordinates = use_relative_coordinates
         self._record_video = record_video
         self._visualize = visualize
         self._visualizer = None
@@ -853,38 +877,69 @@ class PushTEnv:
         return self._model
 
     def get_context_vector(self, data) -> jnp.ndarray:
-        return jnp.concatenate(
-            [
-                jnp.stack(
-                    [
-                        data.joint_positions[:, self._T_target_x_idx],
-                        data.joint_positions[:, self._T_target_y_idx],
-                        data.joint_positions[:, self._T_target_theta_idx],
-                    ],
-                    axis=-1,
-                ),  # target pose
-                jnp.stack(
-                    [
-                        data.joint_positions[:, self._T_x_idx],
-                        data.joint_positions[:, self._T_y_idx],
-                        data.joint_positions[:, self._T_theta_idx],
-                    ],
-                    axis=-1,
-                ),  # T pose
-                jnp.stack(
-                    [
-                        data.joint_velocities[:, self._T_x_idx],
-                        data.joint_velocities[:, self._T_y_idx],
-                        data.joint_velocities[:, self._T_theta_idx],
-                    ],
-                    axis=-1,
-                ),  # T velocity
-                # jnp.stack(
-                #     [data.joint_positions[:, self._pusher_x_idx], data.joint_positions[:, self._pusher_y_idx]], axis=-1
-                # ),  # pusher xy
-            ],
-            axis=-1,
-        )
+
+        if self._use_relative_coordinates:
+            target_x = data.joint_positions[:, self._T_target_x_idx]
+            target_y = data.joint_positions[:, self._T_target_y_idx]
+            target_theta = data.joint_positions[:, self._T_target_theta_idx]
+
+            t_x = data.joint_positions[:, self._T_x_idx]
+            t_y = data.joint_positions[:, self._T_y_idx]
+            t_theta = data.joint_positions[:, self._T_theta_idx]
+
+            vx = data.joint_velocities[:, self._T_x_idx]
+            vy = data.joint_velocities[:, self._T_y_idx]
+            vtheta = data.joint_velocities[:, self._T_theta_idx]
+
+            dx = t_x - target_x
+            dy = t_y - target_y
+            cos_t = jnp.cos(target_theta)
+            sin_t = jnp.sin(target_theta)
+
+            rel_x = dx * cos_t + dy * sin_t
+            rel_y = -dx * sin_t + dy * cos_t
+            rel_theta = t_theta - target_theta
+            rel_vx = vx * cos_t + vy * sin_t
+            rel_vy = -vx * sin_t + vy * cos_t
+
+            return jnp.stack(
+                [target_x, target_y, target_theta, rel_x, rel_y, rel_theta, rel_vx, rel_vy, vtheta],
+                axis=-1,
+            )
+
+        else:
+            return jnp.concatenate(
+                [
+                    jnp.stack(
+                        [
+                            data.joint_positions[:, self._T_target_x_idx],
+                            data.joint_positions[:, self._T_target_y_idx],
+                            data.joint_positions[:, self._T_target_theta_idx],
+                        ],
+                        axis=-1,
+                    ),  # target pose
+                    jnp.stack(
+                        [
+                            data.joint_positions[:, self._T_x_idx],
+                            data.joint_positions[:, self._T_y_idx],
+                            data.joint_positions[:, self._T_theta_idx],
+                        ],
+                        axis=-1,
+                    ),  # T pose
+                    jnp.stack(
+                        [
+                            data.joint_velocities[:, self._T_x_idx],
+                            data.joint_velocities[:, self._T_y_idx],
+                            data.joint_velocities[:, self._T_theta_idx],
+                        ],
+                        axis=-1,
+                    ),  # T velocity
+                    # jnp.stack(
+                    #     [data.joint_positions[:, self._pusher_x_idx], data.joint_positions[:, self._pusher_y_idx]], axis=-1
+                    # ),  # pusher xy
+                ],
+                axis=-1,
+            )
 
     def _sync_visualizer(self) -> None:
         if self._visualizer is None:
