@@ -126,6 +126,7 @@ PERTURB_LAMBDA = 1.25
 
 _SOLVER = ActionSolver()
 _ENV: "PushTEnv | None" = None
+_ENV_BACKWARD: "PushTEnv | None" = None
 _CP_MID = 0.5 * (CONTACT_POINT_BOUNDS[0] + CONTACT_POINT_BOUNDS[1])
 _ANG_MID = 0.5 * (float(ANGLE_BOUNDS[0]) + float(ANGLE_BOUNDS[1]))
 _CP_SCALE = CONTACT_POINT_BOUNDS[1] - CONTACT_POINT_BOUNDS[0]
@@ -146,25 +147,32 @@ def _configure_env(env: "PushTEnv") -> None:
     global _ENV
     _ENV = env
 
+def _configure_backward_env(env: "PushTEnv") -> None:
+    global _ENV_BACKWARD
+    _ENV_BACKWARD = env
+
 
 def _run_rollout(
     face_weights: jnp.ndarray,  # (N, n_actions, NUM_FACES) — soft weights or one-hot
     cp: jnp.ndarray,            # (N, n_actions)
     ang: jnp.ndarray,           # (N, n_actions)
     data,
+    env: "PushTEnv | None" = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Run all action blocks sequentially through step_pure_soft.
 
     Returns (mean_final_dist scalar, t_distances (N, total_steps), jpos_traj (N, total_steps, dofs)).
     Differentiable w.r.t. cp and ang; face_weights treated as constants when one-hot.
+    Pass env explicitly to use a different environment (e.g. _ENV_BACKWARD).
     """
-    assert _ENV is not None, "call _configure_env(env) before training"
+    env = env or _ENV
+    assert env is not None, "call _configure_env(env) before training"
     n_actions = face_weights.shape[1]
     rollout_data = data
     t_distances_parts = []
     jpos_traj_parts = []
     for action_idx in range(n_actions):
-        rollout_data, _, t_dists, jpos = _ENV.step_pure_soft(
+        rollout_data, _, t_dists, jpos = env.step_pure_soft(
             data=rollout_data,
             face_weights=face_weights[:, action_idx, :],
             contact_point=cp[:, action_idx],
@@ -217,25 +225,29 @@ def milp_solver(c: jnp.ndarray, data, rng: jnp.ndarray, verbosity: int) -> jnp.n
 def _milp_forward(c, data, rng, verbosity):
     x_star = _solve_milp_pure_callback(c)
     rng, sample_rng = jax.random.split(rng)
-    return x_star, (c, data, sample_rng, int(verbosity))
+    return x_star, (c, x_star, data, sample_rng, int(verbosity))
 
 
 def _milp_backward(res, grad_x):
-    c, data, sample_rng, verbosity = res
+    c, x_star, data, sample_rng, verbosity = res
     n_envs = c.shape[0]
     n_actions = _n_actions(c.shape[1])
-    assert _ENV is not None, "call _configure_env(env) before training"
+    assert _ENV_BACKWARD is not None, "call _configure_backward_env before training"
+
+    # Continuous params are the same for all M perturbed solves (only face logits are perturbed).
+    x_star_blocks = x_star.reshape(n_envs, n_actions, ACTION_DIM)
+    cp_0 = x_star_blocks[:, :, NUM_FACES]       # (N, n_actions)
+    ang_0 = x_star_blocks[:, :, NUM_FACES + 1]  # (N, n_actions)
 
     key = sample_rng
-    L_ks: list = []
+    face_weights_ks: list = []
     eps_faces: list = []
-    grad_cont_sum = jnp.zeros_like(c)
 
     if verbosity > 0:
         jax.debug.print("  c={c}", c=c)
 
+    # Gurobi pure_callbacks are inherently sequential — loop only for solves.
     for k_i in range(M_ROLLOUTS):
-        # Sample Gaussian noise for face logits only.
         eps_face = jnp.zeros_like(c)
         for action_idx in range(n_actions):
             key, subkey = jax.random.split(key)
@@ -246,37 +258,43 @@ def _milp_backward(res, grad_x):
         c_pert = (c + PERTURB_LAMBDA * eps_face).astype(jnp.float32)
         x_k = _solve_milp_pure_callback(c_pert)
         x_k_blocks = x_k.reshape(n_envs, n_actions, ACTION_DIM)
-
-        face_weights_k = x_k_blocks[:, :, :NUM_FACES]   # (N, n_actions, F)  one-hot from Gurobi
-        cp_k = x_k_blocks[:, :, NUM_FACES]              # (N, n_actions)
-        ang_k = x_k_blocks[:, :, NUM_FACES + 1]         # (N, n_actions)
-
-        # Actual rollout: value + gradient w.r.t. continuous action vars.
-        L_k, (grad_cp_k, grad_ang_k) = jax.value_and_grad(
-            lambda cp, ang: _run_rollout(face_weights_k, cp, ang, data)[0], argnums=(0, 1)
-        )(cp_k, ang_k)
-
-        L_ks.append(L_k)
+        face_weights_ks.append(x_k_blocks[:, :, :NUM_FACES])  # (N, n_actions, F) one-hot
         eps_faces.append(eps_face)
 
-        # Accumulate continuous gradient (grad_cp/ang_k shape: (N, n_actions)).
-        for action_idx in range(n_actions):
-            lo = action_idx * ACTION_DIM
-            grad_cont_sum = grad_cont_sum.at[:, lo + NUM_FACES].add(grad_cp_k[:, action_idx])
-            grad_cont_sum = grad_cont_sum.at[:, lo + NUM_FACES + 1].add(grad_ang_k[:, action_idx])
+    # Stack all M face-weight arrays → (M*N, n_actions, F); tile data → (M*N, ...).
+    # All M rollouts share the same cp/ang (only face differs), so we tile those too
+    # and differentiate through the tiling to get the averaged continuous gradient.
+    face_weights_all = jnp.concatenate(face_weights_ks, axis=0)   # (M*N, n_actions, F)
+    data_tiled = jax.tree.map(lambda x: jnp.repeat(x, M_ROLLOUTS, axis=0), data)
 
-        if verbosity > 1:
-            jax.debug.print("  k={k_i} L_k={L_k}", k_i=k_i, L_k=L_k)
+    def all_rollouts_cost(cp, ang):
+        # cp: (N, n_actions) — tiled inside so grad flows back to this shape.
+        cp_tiled = jnp.repeat(cp, M_ROLLOUTS, axis=0)   # (M*N, n_actions)
+        ang_tiled = jnp.repeat(ang, M_ROLLOUTS, axis=0)
+        _, t_dists, _ = _run_rollout(face_weights_all, cp_tiled, ang_tiled, data_tiled, _ENV_BACKWARD)
+        # t_dists: (M*N, total_steps) → per-rollout costs (M,)
+        L_ks = jnp.nanmean(t_dists[:, -1].reshape(M_ROLLOUTS, n_envs), axis=1)
+        return L_ks.mean(), L_ks  # scalar for grad, L_ks as aux
 
-    # Mean-baseline control variate reduces variance without biasing the estimator.
-    L_mean = sum(L_ks) / M_ROLLOUTS
+    # One parallel backward pass: L_ks for MC face estimator, grads for continuous.
+    (_, L_ks), (grad_cp_0, grad_ang_0) = jax.value_and_grad(
+        all_rollouts_cost, argnums=(0, 1), has_aux=True
+    )(cp_0, ang_0)
+    # grad_cp_0 = (1/M) Σ_k ∂L_k/∂cp  (chain rule through jnp.repeat averages over M)
 
+    # Face MC gradient — mean-baseline control variate reduces variance.
+    L_mean = L_ks.mean()
     grad_c_face = jnp.zeros_like(c)
     for k_i in range(M_ROLLOUTS):
         grad_c_face = grad_c_face + eps_faces[k_i] * (L_ks[k_i] - L_mean)
     grad_c_face = grad_c_face / (M_ROLLOUTS * PERTURB_LAMBDA)
 
-    grad_c_continuous = grad_cont_sum / M_ROLLOUTS
+    # Continuous gradient: map (N, n_actions) grad arrays back into the c layout.
+    grad_c_continuous = jnp.zeros_like(c)
+    for action_idx in range(n_actions):
+        lo = action_idx * ACTION_DIM
+        grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES].set(grad_cp_0[:, action_idx])
+        grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES + 1].set(grad_ang_0[:, action_idx])
 
     if verbosity > 0:
         jax.debug.print("  L_mean={L_mean}", L_mean=L_mean)
@@ -498,6 +516,8 @@ def main(
 
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False, use_relative_coordinates=relative_coordinates)
     _configure_env(env)
+    backward_env = PushTEnv(nenvs=n_envs * M_ROLLOUTS, record_video=False, visualize=False, use_relative_coordinates=relative_coordinates)
+    _configure_backward_env(backward_env)
     random_eval_env = None if disable_random else PushTEnv(nenvs=1, record_video=False, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
