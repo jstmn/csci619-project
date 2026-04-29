@@ -141,7 +141,7 @@ def _configure_solver(multi_step_n_actions: int | None) -> None:
     _SOLVER = ActionSolverMultiStep(n_actions=multi_step_n_actions)
 
 
-def _n_action_blocks(action_dim: int) -> int:
+def _n_actions(action_dim: int) -> int:
     if action_dim % ACTION_DIM != 0:
         raise ValueError(f"Action dimension must be divisible by {ACTION_DIM}, got {action_dim}")
     return action_dim // ACTION_DIM
@@ -186,16 +186,22 @@ def _milp_forward(c, rng, verbosity):
 
 def _milp_backward(res, grad_x):
     c, _x_star, sample_rng, verbosity = res
-    grad_x_safe = jnp.where(jnp.isfinite(grad_x), grad_x, 0.0).astype(jnp.float32)
-    n_action_blocks = _n_action_blocks(c.shape[1])
+    n_actions = _n_actions(c.shape[1])
+
+    # Record keeping
+    x_star_blocks = _x_star.reshape(_x_star.shape[0], n_actions, ACTION_DIM)
+    angle_0 = x_star_blocks[:, :, NUM_FACES + 1]
+    contact_point_0 = x_star_blocks[:, :, NUM_FACES]
+    face_0 = jnp.argmax(x_star_blocks[:, :, :NUM_FACES], axis=-1)
+    grad_x_face = grad_x.reshape(grad_x.shape[0], n_actions, ACTION_DIM)[:, :, :NUM_FACES]
 
     # Direct gradient for continuous outputs: x_star[NUM_FACES] = cp_target and
     # x_star[NUM_FACES + 1] = ang_target within each action block.
     grad_c_continuous = jnp.zeros_like(c)
-    for action_idx in range(n_action_blocks):
-        lo = action_idx * ACTION_DIM
+    for i in range(n_actions):
+        lo = i * ACTION_DIM
         grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES : lo + ACTION_DIM].set(
-            grad_x_safe[:, lo + NUM_FACES : lo + ACTION_DIM]
+            grad_x[:, lo + NUM_FACES : lo + ACTION_DIM]
         )
 
     # Randomized-smoothing estimator for face logits in each action block.
@@ -205,27 +211,28 @@ def _milp_backward(res, grad_x):
         jax.debug.print("  c={c}", c=c)
         jax.debug.print("\n")
 
-    x_star_blocks = _x_star.reshape(_x_star.shape[0], n_action_blocks, ACTION_DIM)
-    angle_0 = x_star_blocks[:, :, NUM_FACES + 1]
-    contact_point_0 = x_star_blocks[:, :, NUM_FACES]
-    face_0 = jnp.argmax(x_star_blocks[:, :, :NUM_FACES], axis=-1)
-    grad_x_face = grad_x_safe.reshape(grad_x_safe.shape[0], n_action_blocks, ACTION_DIM)[:, :, :NUM_FACES]
-
+    # 
     for k_i in range(RANDOMZED_SMOOTHING_K):
         eps_face = jnp.zeros_like(c)
-        for action_idx in range(n_action_blocks):
+
+        # Get c_perturbed
+        for action_idx in range(n_actions):
             key, subkey = jax.random.split(key)
             lo = action_idx * ACTION_DIM
             eps_face = eps_face.at[:, lo : lo + NUM_FACES].set(
                 jax.random.normal(subkey, (c.shape[0], NUM_FACES), dtype=jnp.float32)
             )
         c_pert = (c + PERTURB_LAMBDA * eps_face).astype(jnp.float32)
+
+        # 
         x_k = _solve_milp_pure_callback(c_pert)
-        x_k_blocks = x_k.reshape(x_k.shape[0], n_action_blocks, ACTION_DIM)
+        x_k_blocks = x_k.reshape(x_k.shape[0], n_actions, ACTION_DIM)
         face_k = jnp.argmax(x_k_blocks[:, :, :NUM_FACES], axis=-1)
-        inner = jnp.sum(grad_x_face * x_k_blocks[:, :, :NUM_FACES], axis=(1, 2), keepdims=True)  # (N, 1, 1)
-        inner = inner.reshape(c.shape[0], 1)
-        grad_c_face = grad_c_face + eps_face * inner
+
+        # 
+        dot_product = jnp.sum(grad_x_face * x_k_blocks[:, :, :NUM_FACES], axis=(1, 2), keepdims=True)  # (N, 1, 1)
+        dot_product = dot_product.reshape(c.shape[0], 1)
+        grad_c_face = grad_c_face + eps_face * dot_product
 
         #
         if verbosity > 1:
@@ -450,14 +457,14 @@ def main(
     assert use_soft_face or use_hard_face, "At least one of use_soft_face or use_hard_face must be True."
     assert not (use_soft_face and use_hard_face), "use_soft_face and use_hard_face cannot be True at the same time."
     is_multi_step = multi_step_n_actions is not None
-    n_action_blocks = multi_step_n_actions if is_multi_step else 1
+    n_actions = multi_step_n_actions if is_multi_step else 1
     _configure_solver(multi_step_n_actions)
 
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False, use_relative_coordinates=relative_coordinates)
     random_eval_env = None if disable_random else PushTEnv(nenvs=1, record_video=False, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
-    solver_output_dim = ACTION_DIM * n_action_blocks
+    solver_output_dim = ACTION_DIM * n_actions
     random_pose_str = "random-t-pose" if random_t_pose else "fixed-t-pose"
     multi_step_str = "multi-step" if is_multi_step else "single-step"
     save_dir = Path(f"logs/{now}__n-envs:{n_envs}__lr:{LR}__{random_pose_str}__{multi_step_str}")
@@ -483,8 +490,8 @@ def main(
         # Do one clean forward solve/rollout. The only smoothing Monte Carlo lives
         # in milp_solver's custom VJP, where it estimates dL/dc.
         x_star = milp_solver(c, rng_solve, solver_verbosity)  # (n_envs, action_dim)
-        x_star_blocks = x_star.reshape((x_star.shape[0], n_action_blocks, ACTION_DIM))
-        c_blocks = c.reshape((c.shape[0], n_action_blocks, ACTION_DIM))
+        x_star_blocks = x_star.reshape((x_star.shape[0], n_actions, ACTION_DIM))
+        c_blocks = c.reshape((c.shape[0], n_actions, ACTION_DIM))
         face_weights = x_star_blocks[:, :, :NUM_FACES]
         contact_points = x_star_blocks[:, :, NUM_FACES]
         angles = x_star_blocks[:, :, NUM_FACES + 1]
@@ -507,7 +514,7 @@ def main(
         rollout_data = data
         t_distances_parts = []
         jpos_traj_parts = []
-        for action_idx in range(n_action_blocks):
+        for action_idx in range(n_actions):
             if use_soft_face:
                 rollout_data, _, t_distances_step, jpos_traj_step = env.step_pure_soft(
                     face_weights=face_weights[:, action_idx, :],
@@ -695,7 +702,7 @@ def main(
                 t_pose=env.t_poses[0],
                 seed=it,
                 random_sample_k=RANDOM_ACTION_SAMPLE_K,
-                n_action_steps=n_action_blocks,
+                n_action_steps=n_actions,
             )
             cprint(
                 f"|____ random baseline (env 0): mean={random_mean:.5f} [m], std={random_std:.5f} [m], k={RANDOM_ACTION_SAMPLE_K}",
