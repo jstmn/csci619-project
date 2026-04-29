@@ -110,7 +110,7 @@ LR = 0.01
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
-RANDOMZED_SMOOTHING_K = 20
+M_ROLLOUTS = 10
 RANDOM_ACTION_SAMPLE_K = 5
 FACE_OUTPUT_REG_BETA = 0.05
 CONT_OUTPUT_REG_BETA = 0.005
@@ -125,6 +125,7 @@ PERTURB_LAMBDA = 1.25
 
 
 _SOLVER = ActionSolver()
+_ENV: "PushTEnv | None" = None
 _CP_MID = 0.5 * (CONTACT_POINT_BOUNDS[0] + CONTACT_POINT_BOUNDS[1])
 _ANG_MID = 0.5 * (float(ANGLE_BOUNDS[0]) + float(ANGLE_BOUNDS[1]))
 _CP_SCALE = CONTACT_POINT_BOUNDS[1] - CONTACT_POINT_BOUNDS[0]
@@ -139,6 +140,43 @@ def _configure_solver(multi_step_n_actions: int | None) -> None:
     if multi_step_n_actions < 1:
         raise ValueError("multi_step_n_actions must be >= 1")
     _SOLVER = ActionSolverMultiStep(n_actions=multi_step_n_actions)
+
+
+def _configure_env(env: "PushTEnv") -> None:
+    global _ENV
+    _ENV = env
+
+
+def _run_rollout(
+    face_weights: jnp.ndarray,  # (N, n_actions, NUM_FACES) — soft weights or one-hot
+    cp: jnp.ndarray,            # (N, n_actions)
+    ang: jnp.ndarray,           # (N, n_actions)
+    data,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Run all action blocks sequentially through step_pure_soft.
+
+    Returns (mean_final_dist scalar, t_distances (N, total_steps), jpos_traj (N, total_steps, dofs)).
+    Differentiable w.r.t. cp and ang; face_weights treated as constants when one-hot.
+    """
+    assert _ENV is not None, "call _configure_env(env) before training"
+    n_actions = face_weights.shape[1]
+    rollout_data = data
+    t_distances_parts = []
+    jpos_traj_parts = []
+    for action_idx in range(n_actions):
+        rollout_data, _, t_dists, jpos = _ENV.step_pure_soft(
+            data=rollout_data,
+            face_weights=face_weights[:, action_idx, :],
+            contact_point=cp[:, action_idx],
+            angle=ang[:, action_idx],
+            n_sim_steps=N_SIM_STEPS,
+            check_t_displacement=False,
+        )
+        t_distances_parts.append(t_dists)
+        jpos_traj_parts.append(jpos)
+    t_distances = jnp.concatenate(t_distances_parts, axis=1)
+    jpos_traj = jnp.concatenate(jpos_traj_parts, axis=1)
+    return jnp.nanmean(t_distances[:, -1]), t_distances, jpos_traj
 
 
 def _n_actions(action_dim: int) -> int:
@@ -164,89 +202,87 @@ def _solve_milp_pure_callback(c: jnp.ndarray) -> jnp.ndarray:
 
 
 @jax.custom_vjp
-def milp_solver(c: jnp.ndarray, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray:
+def milp_solver(c: jnp.ndarray, data, rng: jnp.ndarray, verbosity: int) -> jnp.ndarray:
     """Differentiable Gurobi solve: c (N,D) → x_star (N,D).
 
-    Backward (Berthet et al. 2020): Monte Carlo over K_in = RANDOMZED_SMOOTHING_K draws
-        ε_j ~ N(0, I),  x_j = solve(c + λ ε_j)
-        ∂L/∂c[n,i] ≈ (1/(K_in λ)) Σ_j ε_j[n,i] · (grad_x[n] · x_j[n])
-    where grad_x is ∂L/∂x from the same forward branch's rollout (see cost()).
+    Backward: M_ROLLOUTS Monte Carlo draws, each with an actual physics rollout.
+        ε_k ~ N(0, I) (face logits only),  x_k = solve(c + λ ε_k)
+        L_k = rollout_cost(x_k)            (true physics cost)
+        ∂L/∂c_face  ≈ (1/(M λ)) Σ_k ε_k (L_k - mean(L))   [MC estimator, mean-baseline]
+        ∂L/∂c_cont  ≈ (1/M) Σ_k ∂L_k/∂c_cont               [averaged analytical grad]
     """
     return _solve_milp_pure_callback(c)
 
 
-def _milp_forward(c, rng, verbosity):
-    # Primal evaluation solves the Gurobi objective at the branch parameters c.
-    # The K noisy solves used for the randomized-smoothing VJP are deferred to
-    # _milp_backward and only happen during backpropagation.
+def _milp_forward(c, data, rng, verbosity):
     x_star = _solve_milp_pure_callback(c)
     rng, sample_rng = jax.random.split(rng)
-    return x_star, (c, x_star, sample_rng, int(verbosity))
+    return x_star, (c, data, sample_rng, int(verbosity))
 
 
 def _milp_backward(res, grad_x):
-    c, _x_star, sample_rng, verbosity = res
+    c, data, sample_rng, verbosity = res
+    n_envs = c.shape[0]
     n_actions = _n_actions(c.shape[1])
+    assert _ENV is not None, "call _configure_env(env) before training"
 
-    # Record keeping
-    x_star_blocks = _x_star.reshape(_x_star.shape[0], n_actions, ACTION_DIM)
-    angle_0 = x_star_blocks[:, :, NUM_FACES + 1]
-    contact_point_0 = x_star_blocks[:, :, NUM_FACES]
-    face_0 = jnp.argmax(x_star_blocks[:, :, :NUM_FACES], axis=-1)
-    grad_x_face = grad_x.reshape(grad_x.shape[0], n_actions, ACTION_DIM)[:, :, :NUM_FACES]
-
-    # Direct gradient for continuous outputs: x_star[NUM_FACES] = cp_target and
-    # x_star[NUM_FACES + 1] = ang_target within each action block.
-    grad_c_continuous = jnp.zeros_like(c)
-    for i in range(n_actions):
-        lo = i * ACTION_DIM
-        grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES : lo + ACTION_DIM].set(
-            grad_x[:, lo + NUM_FACES : lo + ACTION_DIM]
-        )
-
-    # Randomized-smoothing estimator for face logits in each action block.
-    grad_c_face = jnp.zeros_like(c)
     key = sample_rng
+    L_ks: list = []
+    eps_faces: list = []
+    grad_cont_sum = jnp.zeros_like(c)
+
     if verbosity > 0:
         jax.debug.print("  c={c}", c=c)
-        jax.debug.print("\n")
 
-    # 
-    for k_i in range(RANDOMZED_SMOOTHING_K):
+    for k_i in range(M_ROLLOUTS):
+        # Sample Gaussian noise for face logits only.
         eps_face = jnp.zeros_like(c)
-
-        # Get c_perturbed
         for action_idx in range(n_actions):
             key, subkey = jax.random.split(key)
             lo = action_idx * ACTION_DIM
             eps_face = eps_face.at[:, lo : lo + NUM_FACES].set(
-                jax.random.normal(subkey, (c.shape[0], NUM_FACES), dtype=jnp.float32)
+                jax.random.normal(subkey, (n_envs, NUM_FACES), dtype=jnp.float32)
             )
         c_pert = (c + PERTURB_LAMBDA * eps_face).astype(jnp.float32)
-
-        # 
         x_k = _solve_milp_pure_callback(c_pert)
-        x_k_blocks = x_k.reshape(x_k.shape[0], n_actions, ACTION_DIM)
-        face_k = jnp.argmax(x_k_blocks[:, :, :NUM_FACES], axis=-1)
+        x_k_blocks = x_k.reshape(n_envs, n_actions, ACTION_DIM)
 
-        # 
-        dot_product = jnp.sum(grad_x_face * x_k_blocks[:, :, :NUM_FACES], axis=(1, 2), keepdims=True)  # (N, 1, 1)
-        dot_product = dot_product.reshape(c.shape[0], 1)
-        grad_c_face = grad_c_face + eps_face * dot_product
+        face_weights_k = x_k_blocks[:, :, :NUM_FACES]   # (N, n_actions, F)  one-hot from Gurobi
+        cp_k = x_k_blocks[:, :, NUM_FACES]              # (N, n_actions)
+        ang_k = x_k_blocks[:, :, NUM_FACES + 1]         # (N, n_actions)
 
-        #
+        # Actual rollout: value + gradient w.r.t. continuous action vars.
+        L_k, (grad_cp_k, grad_ang_k) = jax.value_and_grad(
+            lambda cp, ang: _run_rollout(face_weights_k, cp, ang, data)[0], argnums=(0, 1)
+        )(cp_k, ang_k)
+
+        L_ks.append(L_k)
+        eps_faces.append(eps_face)
+
+        # Accumulate continuous gradient (grad_cp/ang_k shape: (N, n_actions)).
+        for action_idx in range(n_actions):
+            lo = action_idx * ACTION_DIM
+            grad_cont_sum = grad_cont_sum.at[:, lo + NUM_FACES].add(grad_cp_k[:, action_idx])
+            grad_cont_sum = grad_cont_sum.at[:, lo + NUM_FACES + 1].add(grad_ang_k[:, action_idx])
+
         if verbosity > 1:
-            jax.debug.print("  {k_i}", k_i=k_i)
-            jax.debug.print("x_perturbed deltas")
-            jax.debug.print("|__ c_pert={c_pert}", c_pert=c_pert)
-            jax.debug.print("|__ face_0={face_0}", face_0=face_0)
-            jax.debug.print("|__ face_k={face_k}", face_k=face_k)
-            jax.debug.print("|__ d_face={d_face}", d_face=face_k - face_0)
-            jax.debug.print("|__ cp=    {delta_cp}", delta_cp=x_k_blocks[:, :, NUM_FACES] - contact_point_0)
-            jax.debug.print("|__ a=     {delta_a}", delta_a=x_k_blocks[:, :, NUM_FACES + 1] - angle_0)
-    grad_c_face = grad_c_face / (RANDOMZED_SMOOTHING_K * PERTURB_LAMBDA)
+            jax.debug.print("  k={k_i} L_k={L_k}", k_i=k_i, L_k=L_k)
+
+    # Mean-baseline control variate reduces variance without biasing the estimator.
+    L_mean = sum(L_ks) / M_ROLLOUTS
+
+    grad_c_face = jnp.zeros_like(c)
+    for k_i in range(M_ROLLOUTS):
+        grad_c_face = grad_c_face + eps_faces[k_i] * (L_ks[k_i] - L_mean)
+    grad_c_face = grad_c_face / (M_ROLLOUTS * PERTURB_LAMBDA)
+
+    grad_c_continuous = grad_cont_sum / M_ROLLOUTS
+
+    if verbosity > 0:
+        jax.debug.print("  L_mean={L_mean}", L_mean=L_mean)
+
     grad_c = grad_c_face + grad_c_continuous
-    return (grad_c, None, None)
+    return (grad_c, None, None, None)
 
 
 milp_solver.defvjp(_milp_forward, _milp_backward)
@@ -278,7 +314,7 @@ def plot_results(
     fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  n_sim_steps={n_sim_steps}  "
-        f"n_opt_steps={n_opt_steps}  K={RANDOMZED_SMOOTHING_K}  λ={PERTURB_LAMBDA}  "
+        f"n_opt_steps={n_opt_steps}  M={M_ROLLOUTS}  λ={PERTURB_LAMBDA}  "
         f"RANDOM_T_POSE={random_t_pose}  FACE_MODE={'soft' if use_soft_face else 'hard'}  RELATIVE_COORDINATES={relative_coordinates}",
         fontweight="bold",
     )
@@ -461,6 +497,7 @@ def main(
     _configure_solver(multi_step_n_actions)
 
     env = PushTEnv(nenvs=n_envs, record_video=record_video, visualize=False, use_relative_coordinates=relative_coordinates)
+    _configure_env(env)
     random_eval_env = None if disable_random else PushTEnv(nenvs=1, record_video=False, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
@@ -487,9 +524,9 @@ def main(
         if verbosity > 1:
             pass
 
-        # Do one clean forward solve/rollout. The only smoothing Monte Carlo lives
-        # in milp_solver's custom VJP, where it estimates dL/dc.
-        x_star = milp_solver(c, rng_solve, solver_verbosity)  # (n_envs, action_dim)
+        # Do one clean forward solve/rollout. The M_ROLLOUTS Monte Carlo rollouts
+        # used for gradient estimation live in milp_solver's custom VJP.
+        x_star = milp_solver(c, data, rng_solve, solver_verbosity)  # (n_envs, action_dim)
         x_star_blocks = x_star.reshape((x_star.shape[0], n_actions, ACTION_DIM))
         c_blocks = c.reshape((c.shape[0], n_actions, ACTION_DIM))
         face_weights = x_star_blocks[:, :, :NUM_FACES]
@@ -511,37 +548,15 @@ def main(
             )
             jax.debug.print("|__")
 
-        rollout_data = data
-        t_distances_parts = []
-        jpos_traj_parts = []
-        for action_idx in range(n_actions):
-            if use_soft_face:
-                rollout_data, _, t_distances_step, jpos_traj_step = env.step_pure_soft(
-                    face_weights=face_weights[:, action_idx, :],
-                    data=rollout_data,
-                    contact_point=contact_points[:, action_idx],
-                    angle=angles[:, action_idx],
-                    n_sim_steps=N_SIM_STEPS,
-                    check_t_displacement=False,
-                )
-            elif use_hard_face:
-                rollout_data, _, t_distances_step, jpos_traj_step = env.step_pure(
-                    face=jnp.argmax(face_weights[:, action_idx, :], axis=-1),
-                    data=rollout_data,
-                    contact_point=contact_points[:, action_idx],
-                    angle=angles[:, action_idx],
-                    n_sim_steps=N_SIM_STEPS,
-                    check_t_displacement=False,
-                )
-            else:
-                raise ValueError(f"Invalid face mode: {args.use_soft_face} or {args.use_hard_face}")
-            t_distances_parts.append(t_distances_step)
-            jpos_traj_parts.append(jpos_traj_step)
-        t_distances = jnp.concatenate(t_distances_parts, axis=1)
-        jpos_traj = jnp.concatenate(jpos_traj_parts, axis=1)
+        # Hard face: pass one-hot weights so _run_rollout can always use step_pure_soft.
+        # One-hot @ face_geometry == hard gather, so physics is identical to step_pure.
+        if use_hard_face:
+            face_weights_in = jax.nn.one_hot(jnp.argmax(face_weights, axis=-1), NUM_FACES)
+        else:
+            face_weights_in = face_weights
+        task_loss, t_distances, jpos_traj = _run_rollout(face_weights_in, contact_points, angles, data)
 
         final_dists = t_distances[:, -1]
-        task_loss = jnp.nanmean(final_dists)
         # The face logits are scale-invariant up to ordering, so lightly
         # penalize them to keep smoothing effective. The per-face targets are
         # already bounded by the sigmoid head.
